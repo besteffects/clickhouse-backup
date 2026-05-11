@@ -1,6 +1,8 @@
 # Test Plan for FIPS compatibility 
 
-## Test Case 1a (Manual): Local smoke workflow
+## Test Case 1a
+
+### Manual: Local smoke workflow
 
 Goal: verify local `clickhouse-backup` FIPS binary can connect to FIPS-compatible ClickHouse server.
 
@@ -40,25 +42,24 @@ clickhouse:
 EOF
 ```
 
-4. Verify binary and connectivity:
+4. Verify connectivity:
 
 ```bash
-./clickhouse-backup/clickhouse-backup-race-fips --version
 ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-fips.yml tables
 ```
 
 Optional stricter runtime mode:
 
 ```bash
-GODEBUG=fips140=on ./clickhouse-backup/clickhouse-backup-race-fips --version
 GODEBUG=fips140=on ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-fips.yml tables
 ```
 
 Expected result:
-- `--version` prints `FIPS 140-3: true`.
 - `tables` command succeeds without authentication/connection errors.
 
-## Test Case 1b (Automation): FIPS-compatible `clickhouse-backup` vs FIPS-compatible ClickHouse
+## Test Case 1b
+
+### Automation: FIPS-compatible `clickhouse-backup` vs FIPS-compatible ClickHouse Server
 
 Goal: run automated scenarios in TestFlows using FIPS-compatible `clickhouse-backup` against FIPS-compatible ClickHouse image.
 
@@ -98,7 +99,9 @@ Expected result:
 - FIPS suite runs; optional scenarios can be skipped with explicit reasons.
 - Logs are available in `test/testflows/`.
 
-## Test Case 2a (Manual): FIPS-compatible `clickhouse-backup` vs FIPS-incompatible ClickHouse
+## Test Case 2a
+
+### Manual: FIPS-compatible `clickhouse-backup` vs FIPS-incompatible ClickHouse Server
 
 Goal: verify local FIPS-compatible `clickhouse-backup` binary can connect to FIPS-incompatible ClickHouse server.
 
@@ -138,20 +141,20 @@ clickhouse:
 EOF
 ```
 
-4. Verify binary and connectivity:
+4. Verify connectivity:
 
 ```bash
-./clickhouse-backup/clickhouse-backup-race-fips --version
 ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-nonfips.yml tables
 ```
 
 Expected result:
-- `--version` prints `FIPS 140-3: true`.
 - `tables` command succeeds against non-FIPS ClickHouse server.
 
-## Test Case 2b (Automation): FIPS-compatible `clickhouse-backup` vs FIPS-incompatible ClickHouse
+## Test Case 2b
 
-Goal: run automated scenarios in TestFlows using FIPS-compatible `clickhouse-backup` while ClickHouse image is non-FIPS.
+### Automation: FIPS-compatible `clickhouse-backup` vs FIPS-incompatible ClickHouse
+
+Goal: run all `clickhouse-backup` automated scenarios in TestFlows using FIPS-compatible `clickhouse-backup` while ClickHouse image is non-FIPS.
 
 Steps:
 
@@ -168,7 +171,6 @@ ls -l clickhouse-backup/clickhouse-backup-race clickhouse-backup/clickhouse-back
 ```bash
 export CLICKHOUSE_TESTS_DIR="$(pwd)/test/testflows/clickhouse_backup"
 export CLICKHOUSE_BACKUP_FIPS_BINARY="$(pwd)/clickhouse-backup/clickhouse-backup-race-fips"
-export GODEBUG=fips140=on
 ```
 
 3. Run FIPS TestFlows against non-FIPS ClickHouse image:
@@ -183,10 +185,35 @@ python3 test/testflows/clickhouse_backup/regression.py \
 ```
 
 Expected result:
-- FIPS suite executes on non-FIPS ClickHouse image.
+- All `/clickhouse backup/*` scenarios execute with FIPS-compatible `clickhouse-backup` against non-FIPS ClickHouse image.
 - Any skips/failures are explicit and can be compared against Test Case 1b.
 
-## Final cleanup
+## Test Case 3
+
+### Run clickhouse-backup-fips -version and check that FIPS 140-3 is true
+
+Goal: verify FIPS-compatible `clickhouse-backup` binary reports FIPS mode in version output.
+
+Steps:
+
+1. Build FIPS-compatible binary:
+
+```bash
+source ~/venv/qa/bin/activate
+make clean build-race-fips-docker
+```
+
+2. Check binary version output:
+
+```bash
+./clickhouse-backup/clickhouse-backup-race-fips --version
+```
+
+Expected result:
+- Output contains `FIPS 140-3: true`.
+
+
+## Final cleanup (local)
 
 Goal: avoid docker garbage and prevent leftover test containers from starting later.
 
