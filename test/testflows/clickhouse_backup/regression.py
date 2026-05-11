@@ -89,6 +89,8 @@ def regression(self, local):
 
             Scenario(run=load("clickhouse_backup.tests.smoke", "smoke"), flags=TE)
 
+
+            Scenario(run=load("clickhouse_backup.tests.fips", "fips"), flags=TE)
             Scenario(run=load("clickhouse_backup.tests.cloud_storage", "cloud_storage"))
             Scenario(run=load("clickhouse_backup.tests.other_engines", "other_engines"))
             Scenario(run=load("clickhouse_backup.tests.api", "api"))
@@ -96,6 +98,7 @@ def regression(self, local):
             Scenario(run=load("clickhouse_backup.tests.generic", "generic"))
             Scenario(run=load("clickhouse_backup.tests.views", "views"))
             Scenario(run=load("clickhouse_backup.tests.config_rbac", "config_rbac"))
+            
     finally:
         shutil.rmtree(config_dir, ignore_errors=True)
 

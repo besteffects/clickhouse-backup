@@ -1,0 +1,289 @@
+import os
+
+from testflows.asserts import error
+from testflows.core import *
+import yaml
+
+from clickhouse_backup.tests.common import config_modifier
+
+
+def _repo_root():
+    here = os.path.abspath(os.path.dirname(__file__))
+    return os.path.normpath(os.path.join(here, "../../../../"))
+
+
+def _resolve_fips_binary():
+    env_bin = os.environ.get("CLICKHOUSE_BACKUP_FIPS_BINARY")
+    candidates = [env_bin] if env_bin else []
+    candidates.extend([
+        os.path.join(_repo_root(), "build/linux/amd64/clickhouse-backup-fips"),
+        os.path.join(_repo_root(), "clickhouse-backup/clickhouse-backup-race-fips"),
+    ])
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    skip("FIPS binary not found, set CLICKHOUSE_BACKUP_FIPS_BINARY or build clickhouse-backup-fips artifact")
+
+
+def _ensure_fips_binary_in_backup_container():
+    host_bin = _resolve_fips_binary()
+    cluster = current().context.cluster
+    backup = current().context.backup
+    container_id = cluster.get_container_id("clickhouse_backup")
+    cluster.command(None, f"docker cp \"{host_bin}\" {container_id}:/bin/clickhouse-backup-fips", exitcode=0)
+    backup.cmd("chmod +x /bin/clickhouse-backup-fips")
+    return "/bin/clickhouse-backup-fips"
+
+
+@TestScenario
+def readelf_go_fipsinfo_offset(self):
+    """Validate the readelf procedure used for go.fipsinfo section discovery."""
+    cluster = self.context.cluster
+    fips_bin = _resolve_fips_binary()
+
+    with When("I inspect ELF sections using the same readelf command used in procedures"):
+        relf = cluster.command(None, f"readelf -S -W \"{fips_bin}\"", exitcode=0)
+
+    with Then("I should see the .go.fipsinfo section and parse its file offset"):
+        assert ".go.fipsinfo" in relf.output, error(relf.output)
+        offset_hex = None
+        for line in relf.output.splitlines():
+            if ".go.fipsinfo" not in line:
+                continue
+            parts = line.split()
+            for i, token in enumerate(parts):
+                if token == ".go.fipsinfo" and i + 3 < len(parts):
+                    offset_hex = parts[i + 3]
+                    break
+            if offset_hex:
+                break
+        assert offset_hex is not None, error("unable to parse .go.fipsinfo file offset from readelf output")
+        assert int(offset_hex, 16) > 0, error(f"unexpected .go.fipsinfo file offset: {offset_hex}")
+
+
+@TestScenario
+def checksum_tamper_panics(self):
+    """Tamper go.fipsinfo checksum and verify startup self-test fails."""
+    cluster = self.context.cluster
+    fips_bin = _resolve_fips_binary()
+    tamper_script = os.path.join(_repo_root(), "scripts/tamper_go_fips_checksum.sh")
+    if not os.path.isfile(tamper_script):
+        skip("scripts/tamper_go_fips_checksum.sh is missing")
+
+    with When("I run the checksum tamper script"):
+        result = cluster.command(None, f"bash \"{tamper_script}\" \"{fips_bin}\"", exitcode=0)
+
+    with Then("tampered binary should fail integrity verification"):
+        assert "fips140: verification mismatch" in result.output, error(result.output)
+
+
+@TestScenario
+def failfipscast_known_answer_tests(self):
+    """Force CAST failures via GODEBUG and verify the process fails."""
+    cluster = self.context.cluster
+    fips_bin = _resolve_fips_binary()
+    casts = ("SHA2-256", "TLSv1.2-SHA2-256")
+
+    for cast_name in casts:
+        with When(f"I force CAST failure for {cast_name}"):
+            result = cluster.command(
+                None,
+                f"GODEBUG=failfipscast={cast_name},fips140=on \"{fips_bin}\" --version",
+                steps=False,
+            )
+
+        with Then("startup should fail and indicate FIPS self-test failure"):
+            assert result.exitcode != 0, error(result.output)
+            out_l = result.output.lower()
+            assert "fips" in out_l or "cast" in out_l or "panic" in out_l, error(result.output)
+
+
+@TestScenario
+def fips_only_mode_version(self):
+    """Validate fips140=only mode can be enabled for the binary."""
+    cluster = self.context.cluster
+    fips_bin = _resolve_fips_binary()
+
+    with When("I run the binary in fips140=only mode"):
+        result = cluster.command(None, f"GODEBUG=fips140=only \"{fips_bin}\" --version", exitcode=0)
+
+    with Then("version output should report FIPS 140-3 enabled"):
+        assert "FIPS 140-3:\t true" in result.output, error(result.output)
+
+
+@TestScenario
+def inbound_tls_cipher_negotiation(self):
+    """Validate inbound TLS only accepts FIPS-compatible ciphers."""
+    backup = self.context.backup
+    fips_bin = _ensure_fips_binary_in_backup_container()
+    cert_dir = "/tmp/fips-api"
+
+    try:
+        with Given("openssl is installed in backup container"):
+            backup.cmd("apt-get update && apt-get install -y openssl", timeout=300)
+
+        with And("I generate temporary CA and server certificates"):
+            backup.cmd(f"mkdir -p {cert_dir}")
+            backup.cmd(f"openssl genrsa -out {cert_dir}/ca-key.pem 4096")
+            backup.cmd(
+                f"openssl req -subj '/O=altinity' -x509 -new -nodes -key {cert_dir}/ca-key.pem -sha256 -days 365000 -out {cert_dir}/ca-cert.pem"
+            )
+            backup.cmd(f"openssl genrsa -out {cert_dir}/server-key.pem 4096")
+            backup.cmd(
+                f"openssl req -subj '/CN=localhost' -addext 'subjectAltName = DNS:localhost' -new -key {cert_dir}/server-key.pem -out {cert_dir}/server-req.csr"
+            )
+            backup.cmd(
+                f"openssl x509 -req -days 365 -extensions SAN -extfile <(printf \"\\n[SAN]\\nsubjectAltName=DNS:localhost\") -in {cert_dir}/server-req.csr -out {cert_dir}/server-cert.pem -CA {cert_dir}/ca-cert.pem -CAkey {cert_dir}/ca-key.pem -CAcreateserial"
+            )
+
+        with And("I start clickhouse-backup-fips server on TLS endpoint"):
+            backup.cmd("pkill -f 'clickhouse-backup-fips server' || true")
+            backup.cmd(
+                f"API_SECURE=true API_LISTEN=0.0.0.0:7172 API_PRIVATE_KEY_FILE={cert_dir}/server-key.pem API_CERTIFICATE_FILE={cert_dir}/server-cert.pem GODEBUG=fips140=only {fips_bin} server >/tmp/fips-api/server.log 2>&1 &"
+            )
+            backup.cmd(
+                "ready=1; for i in $(seq 1 30); do if timeout 1 bash -c '</dev/tcp/localhost/7172'; then ready=0; break; fi; sleep 1; done; test ${ready} -eq 0",
+                timeout=40,
+            )
+
+        with When("I connect with a FIPS-compatible TLSv1.3 ciphersuite"):
+            allowed = backup.cmd(
+                f"openssl s_client -connect localhost:7172 -brief -tls1_3 -ciphersuites TLS_AES_128_GCM_SHA256 -CAfile {cert_dir}/ca-cert.pem < /dev/null",
+                no_checks=True,
+            )
+
+        with Then("the handshake should succeed"):
+            assert allowed.exitcode == 0, error(allowed.output)
+            assert "TLS_AES_128_GCM_SHA256" in allowed.output, error(allowed.output)
+
+        with When("I connect with a non-FIPS TLSv1.3 ciphersuite"):
+            denied = backup.cmd(
+                f"openssl s_client -connect localhost:7172 -brief -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -CAfile {cert_dir}/ca-cert.pem < /dev/null",
+                no_checks=True,
+            )
+
+        with Then("the handshake should be rejected during negotiation"):
+            denied_out = denied.output.lower()
+            assert denied.exitcode != 0 or "handshake failure" in denied_out or "no shared cipher" in denied_out or "alert" in denied_out, error(denied.output)
+    finally:
+        with Finally("I stop temporary clickhouse-backup-fips server"):
+            backup.cmd("pkill -f 'clickhouse-backup-fips server' || true")
+
+
+@TestScenario
+def outbound_tls_cipher_negotiation(self):
+    """Validate outbound TLS from clickhouse-backup-fips rejects non-FIPS ciphers."""
+    backup = self.context.backup
+    fips_bin = _ensure_fips_binary_in_backup_container()
+    cert_dir = "/tmp/fips-api"
+    config_path = self.context.backup_config_file
+
+    with Given("I save current backup config"):
+        with open(config_path, "r", encoding="utf-8") as f:
+            original_config = yaml.safe_load(f)
+
+    try:
+        with And("openssl is installed in backup container"):
+            backup.cmd("apt-get update && apt-get install -y openssl", timeout=300)
+
+        with And("I generate temporary TLS certs for outbound target server"):
+            backup.cmd(f"mkdir -p {cert_dir}")
+            backup.cmd(f"openssl genrsa -out {cert_dir}/ca-key.pem 4096")
+            backup.cmd(
+                f"openssl req -subj '/O=altinity' -x509 -new -nodes -key {cert_dir}/ca-key.pem -sha256 -days 365000 -out {cert_dir}/ca-cert.pem"
+            )
+            backup.cmd(f"openssl genrsa -out {cert_dir}/server-key.pem 4096")
+            backup.cmd(
+                f"openssl req -subj '/CN=localhost' -addext 'subjectAltName = DNS:localhost' -new -key {cert_dir}/server-key.pem -out {cert_dir}/server-req.csr"
+            )
+            backup.cmd(
+                f"openssl x509 -req -days 365 -extensions SAN -extfile <(printf \"\\n[SAN]\\nsubjectAltName=DNS:localhost\") -in {cert_dir}/server-req.csr -out {cert_dir}/server-cert.pem -CA {cert_dir}/ca-cert.pem -CAkey {cert_dir}/ca-key.pem -CAcreateserial"
+            )
+
+        with And("I configure clickhouse-backup to use HTTPS S3 endpoint on localhost"):
+            config_modifier(
+                fields={
+                    "general": {"remote_storage": "s3"},
+                    "s3": {
+                        "access_key": "access_key",
+                        "secret_key": "it_is_my_super_secret_key",
+                        "bucket": "clickhouse",
+                        "region": "us-east-1",
+                        "endpoint": "https://localhost:9443",
+                        "force_path_style": True,
+                        "disable_ssl": False,
+                    },
+                }
+            )
+
+        with When("remote TLS server allows only a FIPS-compatible TLSv1.3 ciphersuite"):
+            backup.cmd("pkill -f 'openssl s_server -accept 9443' || true")
+            backup.cmd(
+                f"openssl s_server -accept 9443 -cert {cert_dir}/server-cert.pem -key {cert_dir}/server-key.pem -tls1_3 -ciphersuites TLS_AES_128_GCM_SHA256 -quiet -naccept 1 > {cert_dir}/s_server_allowed.log 2>&1 &"
+            )
+            allowed = backup.cmd(
+                f"GODEBUG=fips140=only {fips_bin} -c /etc/clickhouse-backup/config.yml list remote",
+                no_checks=True,
+                timeout=40,
+            )
+            allowed_log = backup.cmd(f"cat {cert_dir}/s_server_allowed.log || true", no_checks=True).output
+
+        with Then("outbound handshake should not fail due to TLS cipher negotiation"):
+            allowed_out = (allowed.output or "").lower()
+            assert "handshake failure" not in allowed_out and "no shared cipher" not in allowed_out, error(allowed.output)
+            assert "alert handshake failure" not in allowed_log.lower(), error(allowed_log)
+
+        with When("remote TLS server allows only a non-FIPS TLSv1.3 ciphersuite"):
+            backup.cmd("pkill -f 'openssl s_server -accept 9443' || true")
+            backup.cmd(
+                f"openssl s_server -accept 9443 -cert {cert_dir}/server-cert.pem -key {cert_dir}/server-key.pem -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -quiet -naccept 1 > {cert_dir}/s_server_denied.log 2>&1 &"
+            )
+            denied = backup.cmd(
+                f"GODEBUG=fips140=only {fips_bin} -c /etc/clickhouse-backup/config.yml list remote",
+                no_checks=True,
+                timeout=40,
+            )
+            denied_log = backup.cmd(f"cat {cert_dir}/s_server_denied.log || true", no_checks=True).output
+
+        with Then("outbound handshake should be rejected during negotiation"):
+            denied_out = (denied.output or "").lower()
+            denied_srv = (denied_log or "").lower()
+            assert (
+                "handshake failure" in denied_out
+                or "no shared cipher" in denied_out
+                or "tls:" in denied_out
+                or "alert handshake failure" in denied_srv
+                or "no shared cipher" in denied_srv
+            ), error(f"client_out={denied.output}\nserver_log={denied_log}")
+    finally:
+        with Finally("I restore backup config"):
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(original_config, f, default_flow_style=False)
+        with And("I stop temporary outbound TLS server"):
+            backup.cmd("pkill -f 'openssl s_server -accept 9443' || true")
+
+
+@TestScenario
+def acvp_wrapper(self):
+    """Run ACVP wrapper when explicitly enabled."""
+    cluster = self.context.cluster
+    if os.environ.get("RUN_ACVP_TESTS") != "1":
+        skip("RUN_ACVP_TESTS is not enabled")
+
+    run_sh = os.path.join(_repo_root(), "pkg/acvpwrapper/run.sh")
+    if not os.path.isfile(run_sh):
+        skip("pkg/acvpwrapper/run.sh is missing in this branch")
+
+    with When("I run ACVP wrapper against the binary"):
+        result = cluster.command(None, f"bash \"{run_sh}\"", timeout=1800, exitcode=0)
+
+    with Then("the ACVP run should complete successfully"):
+        out_l = result.output.lower()
+        assert "pass" in out_l or "success" in out_l, error(result.output)
+
+
+@TestFeature
+def fips(self):
+    """FIPS compliance tests for clickhouse-backup in TestFlows."""
+    for scenario in loads(current_module(), Scenario, Suite):
+        Scenario(run=scenario)
