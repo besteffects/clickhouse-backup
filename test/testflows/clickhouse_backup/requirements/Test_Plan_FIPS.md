@@ -213,6 +213,28 @@ Expected result:
 - Output contains `FIPS 140-3: true`.
 
 
+## Test Case 4
+
+### Check that GOFIPS140 is set in CI/CD build code (`GOFIPS140=v1.0.0`)
+
+Goal: verify FIPS build paths in repository code explicitly set `GOFIPS140=v1.0.0`.
+
+Steps:
+
+1. Search build definitions for GOFIPS140 in `clickhouse-backup/Makefile` and `clickhouse-backup/Dockerfile`:
+
+```bash
+grep -n "GOFIPS140=v1.0.0" Makefile Dockerfile
+```
+
+2. Review matches and confirm they are in FIPS build targets:
+- `clickhouse-backup/Makefile` target for FIPS build output.
+- `clickhouse-backup/Dockerfile` command that builds `clickhouse-backup-race-fips`.
+
+Expected result:
+- `GOFIPS140=v1.0.0` is present in FIPS build definitions (`clickhouse-backup/Makefile` and `clickhouse-backup/Dockerfile`).
+- No missing GOFIPS140 setting in the paths used to produce FIPS artifacts.
+
 ## Final cleanup (local)
 
 Goal: avoid docker garbage and prevent leftover test containers from starting later.
