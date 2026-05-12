@@ -47,7 +47,7 @@ def _clickhouse_server_version():
 
 @TestScenario
 def fips_binary_connectivity_fips_clickhouse(self):
-    """Test Case 1: automate FIPS binary connectivity on FIPS-compatible ClickHouse."""
+    """Test Case 1b: automate FIPS binary connectivity on FIPS-compatible ClickHouse."""
     backup = self.context.backup
     fips_bin = _ensure_fips_binary_in_backup_container()
 
@@ -75,7 +75,7 @@ def fips_binary_connectivity_fips_clickhouse(self):
 
 @TestScenario
 def fips_binary_connectivity_nonfips_clickhouse(self):
-    """Test Case 2: automate FIPS binary connectivity on non-FIPS ClickHouse."""
+    """Test Case 2b: automate FIPS binary connectivity on non-FIPS ClickHouse."""
     backup = self.context.backup
     fips_bin = _ensure_fips_binary_in_backup_container()
 
