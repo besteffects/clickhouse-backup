@@ -235,6 +235,41 @@ Expected result:
 - `GOFIPS140=v1.0.0` is present in FIPS build definitions (`clickhouse-backup/Makefile` and `clickhouse-backup/Dockerfile`).
 - No missing GOFIPS140 setting in the paths used to produce FIPS artifacts.
 
+
+
+
+
+## Test Case 5
+
+### Corrupt `.go.fipsinfo` checksum and verify FIPS integrity self-check fails
+
+Goal: verify startup integrity self-check rejects a tampered FIPS binary with expected `fips140: verification mismatch` failure.
+
+Steps:
+
+1. Build FIPS-compatible binary:
+
+```bash
+source ~/venv/qa/bin/activate
+make clean build-race-fips-docker
+```
+
+2. Run checksum tamper script against FIPS binary:
+
+```bash
+./test/testflows/clickhouse_backup/scripts/tamper_go_fips_checksum.sh ./clickhouse-backup/clickhouse-backup-race-fips
+```
+
+3. Validate output:
+- Script prints `.go.fipsinfo` section details and an XOR tamper step.
+- Running the tampered copy panics with `fips140: verification mismatch`.
+- Script ends with `OK: FIPS integrity check failed as expected`.
+
+Expected result:
+- Integrity self-check fails on startup for the tampered binary.
+- Failure is explicit (`panic: fips140: verification mismatch`) and process exits non-zero.
+- Behavior matches automated TestFlows scenario `checksum_tamper_panics`.
+
 ## Final cleanup (local)
 
 Goal: avoid docker garbage and prevent leftover test containers from starting later.

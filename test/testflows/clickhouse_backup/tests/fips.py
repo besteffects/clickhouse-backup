@@ -66,9 +66,13 @@ def checksum_tamper_panics(self):
     """Tamper go.fipsinfo checksum and verify startup self-test fails."""
     cluster = self.context.cluster
     fips_bin = _resolve_fips_binary()
-    tamper_script = os.path.join(_repo_root(), "scripts/tamper_go_fips_checksum.sh")
-    if not os.path.isfile(tamper_script):
-        skip("scripts/tamper_go_fips_checksum.sh is missing")
+    script_candidates = [
+        os.path.join(_repo_root(), "test/testflows/clickhouse_backup/scripts/tamper_go_fips_checksum.sh"),
+        os.path.join(_repo_root(), "scripts/tamper_go_fips_checksum.sh"),
+    ]
+    tamper_script = next((path for path in script_candidates if os.path.isfile(path)), None)
+    if not tamper_script:
+        skip("tamper_go_fips_checksum.sh is missing")
 
     with When("I run the checksum tamper script"):
         result = cluster.command(None, f"bash \"{tamper_script}\" \"{fips_bin}\"", exitcode=0)

@@ -78,9 +78,9 @@ Execution examples:
 ### 3) Code integrity self-check (tamper)
 
 - Script:
-  - `scripts/tamper_go_fips_checksum.sh`
+  - `test/testflows/clickhouse_backup/scripts/tamper_go_fips_checksum.sh`
 - Command:
-  - `scripts/tamper_go_fips_checksum.sh ./build/linux/amd64/clickhouse-backup-fips`
+  - `test/testflows/clickhouse_backup/scripts/tamper_go_fips_checksum.sh ./build/linux/amd64/clickhouse-backup-fips`
 - Expected:
   - startup fails with `fips140: verification mismatch`.
 
