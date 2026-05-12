@@ -8,11 +8,13 @@ from clickhouse_backup.tests.common import config_modifier
 
 
 def _repo_root():
+    """Return repository root path resolved from this test file location."""
     here = os.path.abspath(os.path.dirname(__file__))
     return os.path.normpath(os.path.join(here, "../../../../"))
 
 
 def _resolve_fips_binary():
+    """Resolve host path to FIPS binary from env or known build locations."""
     env_bin = os.environ.get("CLICKHOUSE_BACKUP_FIPS_BINARY")
     candidates = [env_bin] if env_bin else []
     candidates.extend([
@@ -26,6 +28,7 @@ def _resolve_fips_binary():
 
 
 def _ensure_fips_binary_in_backup_container():
+    """Copy resolved FIPS binary into backup container and return container path."""
     host_bin = _resolve_fips_binary()
     cluster = current().context.cluster
     backup = current().context.backup
@@ -35,35 +38,104 @@ def _ensure_fips_binary_in_backup_container():
     return "/bin/clickhouse-backup-fips"
 
 
+def _clickhouse_server_version():
+    """Return ClickHouse version string from clickhouse1 node in the cluster."""
+    node = current().context.cluster.node("clickhouse1")
+    result = node.query("select version()", exitcode=0, steps=False)
+    return (result.output or "").strip()
+
+
 @TestScenario
-def readelf_go_fipsinfo_offset(self):
-    """Validate the readelf procedure used for go.fipsinfo section discovery."""
+def fips_binary_connectivity_fips_clickhouse(self):
+    """Test Case 1: automate FIPS binary connectivity on FIPS-compatible ClickHouse."""
+    backup = self.context.backup
+    fips_bin = _ensure_fips_binary_in_backup_container()
+
+    with Given("I detect ClickHouse server version in the test cluster"):
+        ch_version = _clickhouse_server_version()
+
+    if "altinityfips" not in ch_version:
+        skip(f"this scenario is only for FIPS-compatible ClickHouse, got version: {ch_version}")
+
+    with When("I run FIPS binary version check"):
+        version_out = backup.cmd(f"{fips_bin} --version", exitcode=0)
+
+    with Then("version output should report FIPS 140-3 enabled"):
+        assert "FIPS 140-3:\t true" in version_out.output, error(version_out.output)
+
+    with When("I run tables command against FIPS-compatible ClickHouse"):
+        tables_out = backup.cmd(
+            f"GODEBUG=fips140=on {fips_bin} -c /etc/clickhouse-backup/config.yml tables",
+            no_checks=True,
+        )
+
+    with Then("tables command should succeed"):
+        assert tables_out.exitcode == 0, error(tables_out.output)
+
+
+@TestScenario
+def fips_binary_connectivity_nonfips_clickhouse(self):
+    """Test Case 2: automate FIPS binary connectivity on non-FIPS ClickHouse."""
+    backup = self.context.backup
+    fips_bin = _ensure_fips_binary_in_backup_container()
+
+    with Given("I detect ClickHouse server version in the test cluster"):
+        ch_version = _clickhouse_server_version()
+
+    if "altinitystable" not in ch_version:
+        skip(f"this scenario is only for non-FIPS ClickHouse, got version: {ch_version}")
+
+    with When("I run FIPS binary version check"):
+        version_out = backup.cmd(f"{fips_bin} --version", exitcode=0)
+
+    with Then("version output should still report FIPS 140-3 enabled"):
+        assert "FIPS 140-3:\t true" in version_out.output, error(version_out.output)
+
+    with When("I run tables command against non-FIPS ClickHouse"):
+        tables_out = backup.cmd(
+            f"GODEBUG=fips140=on {fips_bin} -c /etc/clickhouse-backup/config.yml tables",
+            no_checks=True,
+        )
+
+    with Then("tables command should succeed"):
+        assert tables_out.exitcode == 0, error(tables_out.output)
+
+
+@TestScenario
+def fips_only_mode_version(self):
+    """Test Case 3: validate fips140=only mode reports FIPS-enabled binary."""
     cluster = self.context.cluster
     fips_bin = _resolve_fips_binary()
 
-    with When("I inspect ELF sections using the same readelf command used in procedures"):
-        relf = cluster.command(None, f"readelf -S -W \"{fips_bin}\"", exitcode=0)
+    with When("I run the binary in fips140=only mode"):
+        result = cluster.command(None, f"GODEBUG=fips140=only \"{fips_bin}\" --version", exitcode=0)
 
-    with Then("I should see the .go.fipsinfo section and parse its file offset"):
-        assert ".go.fipsinfo" in relf.output, error(relf.output)
-        offset_hex = None
-        for line in relf.output.splitlines():
-            if ".go.fipsinfo" not in line:
-                continue
-            parts = line.split()
-            for i, token in enumerate(parts):
-                if token == ".go.fipsinfo" and i + 3 < len(parts):
-                    offset_hex = parts[i + 3]
-                    break
-            if offset_hex:
-                break
-        assert offset_hex is not None, error("unable to parse .go.fipsinfo file offset from readelf output")
-        assert int(offset_hex, 16) > 0, error(f"unexpected .go.fipsinfo file offset: {offset_hex}")
+    with Then("version output should report FIPS 140-3 enabled"):
+        assert "FIPS 140-3:\t true" in result.output, error(result.output)
+
+
+@TestScenario
+def gofips140_build_flags_present(self):
+    """Test Case 4: validate GOFIPS140 build flag in Makefile and Dockerfile."""
+    cluster = self.context.cluster
+    makefile = os.path.join(_repo_root(), "Makefile")
+    dockerfile = os.path.join(_repo_root(), "Dockerfile")
+
+    with When("I check build definitions for GOFIPS140=v1.0.0"):
+        result = cluster.command(
+            None,
+            f"grep -n \"GOFIPS140=v1.0.0\" \"{makefile}\" \"{dockerfile}\"",
+            exitcode=0,
+        )
+
+    with Then("both Makefile and Dockerfile should contain GOFIPS140 build flag"):
+        assert "Makefile:" in result.output, error(result.output)
+        assert "Dockerfile:" in result.output, error(result.output)
 
 
 @TestScenario
 def checksum_tamper_panics(self):
-    """Tamper go.fipsinfo checksum and verify startup self-test fails."""
+    """Test Case 5: tamper go.fipsinfo checksum and verify startup self-test fails."""
     cluster = self.context.cluster
     fips_bin = _resolve_fips_binary()
     script_candidates = [
@@ -83,7 +155,7 @@ def checksum_tamper_panics(self):
 
 @TestScenario
 def failfipscast_known_answer_tests(self):
-    """Force CAST failures via GODEBUG and verify the process fails."""
+    """Test Case 6: force CAST failures via GODEBUG and verify process fails."""
     cluster = self.context.cluster
     fips_bin = _resolve_fips_binary()
     casts = ("SHA2-256", "TLSv1.2-SHA2-256")
@@ -103,21 +175,8 @@ def failfipscast_known_answer_tests(self):
 
 
 @TestScenario
-def fips_only_mode_version(self):
-    """Validate fips140=only mode can be enabled for the binary."""
-    cluster = self.context.cluster
-    fips_bin = _resolve_fips_binary()
-
-    with When("I run the binary in fips140=only mode"):
-        result = cluster.command(None, f"GODEBUG=fips140=only \"{fips_bin}\" --version", exitcode=0)
-
-    with Then("version output should report FIPS 140-3 enabled"):
-        assert "FIPS 140-3:\t true" in result.output, error(result.output)
-
-
-@TestScenario
 def inbound_tls_cipher_negotiation(self):
-    """Validate inbound TLS only accepts FIPS-compatible ciphers."""
+    """Test Case 7: validate inbound TLS accepts only FIPS-compatible ciphers."""
     backup = self.context.backup
     fips_bin = _ensure_fips_binary_in_backup_container()
     cert_dir = "/tmp/fips-api"
@@ -176,7 +235,7 @@ def inbound_tls_cipher_negotiation(self):
 
 @TestScenario
 def outbound_tls_cipher_negotiation(self):
-    """Validate outbound TLS from clickhouse-backup-fips rejects non-FIPS ciphers."""
+    """Test Case 8: validate outbound TLS rejects non-FIPS ciphers."""
     backup = self.context.backup
     fips_bin = _ensure_fips_binary_in_backup_container()
     cert_dir = "/tmp/fips-api"
@@ -280,8 +339,34 @@ def outbound_tls_cipher_negotiation(self):
 
 
 @TestScenario
+def readelf_go_fipsinfo_offset(self):
+    """Support check (non-numbered): validate readelf can find .go.fipsinfo section."""
+    cluster = self.context.cluster
+    fips_bin = _resolve_fips_binary()
+
+    with When("I inspect ELF sections using the same readelf command used in procedures"):
+        relf = cluster.command(None, f"readelf -S -W \"{fips_bin}\"", exitcode=0)
+
+    with Then("I should see the .go.fipsinfo section and parse its file offset"):
+        assert ".go.fipsinfo" in relf.output, error(relf.output)
+        offset_hex = None
+        for line in relf.output.splitlines():
+            if ".go.fipsinfo" not in line:
+                continue
+            parts = line.split()
+            for i, token in enumerate(parts):
+                if token == ".go.fipsinfo" and i + 3 < len(parts):
+                    offset_hex = parts[i + 3]
+                    break
+            if offset_hex:
+                break
+        assert offset_hex is not None, error("unable to parse .go.fipsinfo file offset from readelf output")
+        assert int(offset_hex, 16) > 0, error(f"unexpected .go.fipsinfo file offset: {offset_hex}")
+
+
+@TestScenario
 def acvp_wrapper(self):
-    """Run ACVP wrapper when explicitly enabled."""
+    """Support check (optional): run ACVP wrapper when explicitly enabled."""
     cluster = self.context.cluster
     if os.environ.get("RUN_ACVP_TESTS") != "1":
         skip("RUN_ACVP_TESTS is not enabled")
@@ -301,5 +386,27 @@ def acvp_wrapper(self):
 @TestFeature
 def fips(self):
     """FIPS compliance tests for clickhouse-backup in TestFlows."""
-    for scenario in loads(current_module(), Scenario, Suite):
+    # Keep execution order aligned with scenario-level checks in Test_Plan_FIPS.md:
+    # TC1 -> TC2 -> TC3 -> TC4 -> TC5 -> TC6 -> TC7 -> TC8.
+    # Manual workflows 1a/2a are intentionally not automated here.
+
+    plan_order_scenarios = [
+        fips_binary_connectivity_fips_clickhouse,
+        fips_binary_connectivity_nonfips_clickhouse,
+        fips_only_mode_version,
+        gofips140_build_flags_present,
+        checksum_tamper_panics,
+        failfipscast_known_answer_tests,
+        inbound_tls_cipher_negotiation,
+        outbound_tls_cipher_negotiation,
+    ]
+    for scenario in plan_order_scenarios:
+        Scenario(run=scenario)
+
+    # Additional/supporting scenarios not mapped to numbered test cases.
+    optional_additional = [
+        readelf_go_fipsinfo_offset,
+        acvp_wrapper,
+    ]
+    for scenario in optional_additional:
         Scenario(run=scenario)
