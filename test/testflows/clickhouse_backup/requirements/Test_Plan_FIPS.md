@@ -237,8 +237,6 @@ Expected result:
 
 
 
-
-
 ## Test Case 5
 
 ### Corrupt `.go.fipsinfo` checksum and verify FIPS integrity self-check fails
@@ -276,6 +274,11 @@ Expected result:
 
 Goal: verify FIPS startup self-tests (CAST) are enforced by forcing specific CAST checks to fail and confirming `clickhouse-backup-fips` does not start successfully.
 
+Reference:
+- Source of valid `failfipscast` values is Go FIPS test list `allCASTs` in `crypto/internal/fips140test/cast_test.go`.
+- Primary reference (browser): `https://tip.golang.org/src/crypto/internal/fips140test/cast_test.go` (`allCASTs`, lines 39-65).
+- Optional local path (if Go is installed): `$(go env GOROOT)/src/crypto/internal/fips140test/cast_test.go`.
+
 Steps:
 
 1. Build FIPS-compatible binary:
@@ -302,6 +305,118 @@ Expected result:
 - Output explicitly indicates startup self-test failure (contains `fips`, `cast`, or `panic`).
 - A zero exit code for either command is a test failure.
 - This manual check is covered by automated scenario `failfipscast_known_answer_tests`.
+
+## Test Case 7
+
+### Validate inbound TLS cipher policy with `openssl s_client` (FIPS-compatible vs non-compatible)
+
+Goal: verify `clickhouse-backup-fips` TLS endpoint accepts FIPS-compatible ciphers and rejects non-compatible ciphers. Validate both TLSv1.3 (`-ciphersuites`) and TLSv1.2 (`-cipher`) client options.
+
+Steps:
+
+1. Build FIPS-compatible binary:
+
+```bash
+source ~/venv/qa/bin/activate
+make clean build-race-fips-docker
+```
+
+2. Start `clickhouse-backup-fips` API server in strict FIPS mode with temporary TLS certificate:
+
+```bash
+TMP_TLS_DIR=/tmp/chb-fips-tls
+rm -rf "$TMP_TLS_DIR" && mkdir -p "$TMP_TLS_DIR"
+openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+  -keyout "$TMP_TLS_DIR/server-key.pem" \
+  -out "$TMP_TLS_DIR/server-cert.pem" \
+  -subj "/CN=localhost"
+pkill -f "clickhouse-backup-race-fips server" 2>/dev/null || true
+API_SECURE=true API_LISTEN=0.0.0.0:7172 \
+API_PRIVATE_KEY_FILE="$TMP_TLS_DIR/server-key.pem" \
+API_CERTIFICATE_FILE="$TMP_TLS_DIR/server-cert.pem" \
+GODEBUG=fips140=only \
+./clickhouse-backup/clickhouse-backup-race-fips server >"$TMP_TLS_DIR/server.log" 2>&1 &
+sleep 2
+```
+
+3. Run `openssl s_client` with FIPS-compatible TLSv1.3 ciphersuite (`cipherSuites` equivalent):
+
+```bash
+openssl s_client -connect localhost:7172 -brief -tls1_3 \
+  -ciphersuites TLS_AES_128_GCM_SHA256 \
+  -CAfile "$TMP_TLS_DIR/server-cert.pem" < /dev/null
+```
+
+4. Run `openssl s_client` with non-compatible TLSv1.3 ciphersuite:
+
+```bash
+openssl s_client -connect localhost:7172 -brief -tls1_3 \
+  -ciphersuites TLS_CHACHA20_POLY1305_SHA256 \
+  -CAfile "$TMP_TLS_DIR/server-cert.pem" < /dev/null
+```
+
+5. Run TLSv1.2 check using `-cipher` (`cipherList` equivalent):
+
+```bash
+openssl s_client -connect localhost:7172 -brief -tls1_2 \
+  -cipher AES128-GCM-SHA256 \
+  -CAfile "$TMP_TLS_DIR/server-cert.pem" < /dev/null
+openssl s_client -connect localhost:7172 -brief -tls1_2 \
+  -cipher ECDHE-RSA-CHACHA20-POLY1305 \
+  -CAfile "$TMP_TLS_DIR/server-cert.pem" < /dev/null
+```
+
+6. Stop test server:
+
+```bash
+pkill -f "clickhouse-backup-race-fips server" 2>/dev/null || true
+```
+
+Expected result:
+- TLSv1.3 with `TLS_AES_128_GCM_SHA256` succeeds (handshake established).
+- TLSv1.3 with `TLS_CHACHA20_POLY1305_SHA256` is rejected (handshake failure / no shared cipher / alert).
+- TLSv1.2 with `AES128-GCM-SHA256` succeeds.
+- TLSv1.2 with `ECDHE-RSA-CHACHA20-POLY1305` is rejected.
+- The same inbound TLS policy applies to endpoints on this secure listener, including `/metrics` when metrics are enabled on the API server.
+- This manual check is covered by automated scenario `inbound_tls_cipher_negotiation` (TLSv1.3 allow/deny path).
+
+## Test Case 8
+
+### Validate outbound TLS policy with `openssl s_server` (clickhouse-backup as TLS client)
+
+Goal: verify `clickhouse-backup-fips` rejects a remote TLS server that offers only non-FIPS ciphers.  
+Scope difference from Test Case 7: Test Case 7 validates inbound policy on `clickhouse-backup-fips server`; this test validates outbound policy when `clickhouse-backup-fips` connects to remote storage over TLS.
+
+Steps:
+
+1. Build binaries required by TestFlows environment:
+
+```bash
+source ~/venv/qa/bin/activate
+make clean build-race-docker build-race-fips-docker
+```
+
+2. Run outbound TLS check against non-compatible server ciphers:
+
+```bash
+export CLICKHOUSE_TESTS_DIR="$(pwd)/test/testflows/clickhouse_backup"
+export CLICKHOUSE_BACKUP_FIPS_BINARY="$(pwd)/clickhouse-backup/clickhouse-backup-race-fips"
+export RUN_TESTS="/clickhouse backup/fips/outbound tls cipher negotiation"
+GITHUB_ACTIONS=1 \
+CLICKHOUSE_IMAGE=altinity/clickhouse-server \
+CLICKHOUSE_VERSION=25.3.8.30001.altinityfips \
+./test/testflows/run.sh
+```
+
+3. Review scenario output:
+- The scenario starts local `openssl s_server` with FIPS-compatible cipher (`TLS_AES_128_GCM_SHA256`) and then with non-compatible cipher (`TLS_CHACHA20_POLY1305_SHA256`).
+- It verifies that outbound `clickhouse-backup-fips ... list remote` handshake is accepted for the compatible server and rejected for the non-compatible server.
+
+Expected result:
+- Connection to compatible `openssl s_server` cipher is not rejected by TLS negotiation.
+- Connection to non-compatible `openssl s_server` cipher fails at TLS negotiation (`handshake failure`, `no shared cipher`, or equivalent TLS error).
+- Test is covered by automated scenario `outbound_tls_cipher_negotiation`.
+- If AWS SDK endpoint rules block custom FIPS endpoint usage (`custom endpoint cannot be combined with fips`), scenario is skipped with explicit reason.
 
 ## Final cleanup (local)
 
