@@ -73,8 +73,8 @@ make clean build-race-docker build-race-fips-docker
 ls -l clickhouse-backup/clickhouse-backup-race clickhouse-backup/clickhouse-backup-race-fips
 ```
 
-TestFlows starts the backup container from `clickhouse-backup/clickhouse-backup-race`,
-while FIPS tests additionally use `clickhouse-backup/clickhouse-backup-race-fips`.
+This test case runs all `/clickhouse backup/*` scenarios while forcing the FIPS
+binary via `CLICKHOUSE_BACKUP_FIPS_BINARY`.
 
 2. Set TestFlows context:
 
@@ -209,6 +209,12 @@ make clean build-race-fips-docker
 ./clickhouse-backup/clickhouse-backup-race-fips --version
 ```
 
+Optional one-line check:
+
+```bash
+./clickhouse-backup/clickhouse-backup-race-fips --version | grep "FIPS 140-3"
+```
+
 Expected result:
 - Output contains `FIPS 140-3: true`.
 
@@ -266,17 +272,18 @@ make clean build-race-fips-docker
 Expected result:
 - Integrity self-check fails on startup for the tampered binary.
 - Failure is explicit (`panic: fips140: verification mismatch`) and process exits non-zero.
-- Behavior matches automated TestFlows scenario `checksum_tamper_panics`.
+- Note: Behavior matches automated TestFlows scenario `checksum_tamper_panics`.
 
 ## Test Case 6
 
 ### Simulate CAST self-test failures using `GODEBUG=failfipscast=...`
 
-Goal: verify FIPS startup self-tests (CAST) are enforced by forcing specific CAST checks to fail and confirming `clickhouse-backup-fips` does not start successfully.
+Goal: verify FIPS startup self-tests (CAST) are enforced by forcing CAST checks `SHA2-256` and `TLSv1.2-SHA2-256` to fail, and confirming `clickhouse-backup-fips` does not start successfully.
+Scope note: this is a local process startup self-test of the `clickhouse-backup-fips` binary. No network handshake is involved, so there is no TLS client/server role in this case.
 
 Reference:
 - Source of valid `failfipscast` values is Go FIPS test list `allCASTs` in `crypto/internal/fips140test/cast_test.go`.
-- Primary reference (browser): `https://tip.golang.org/src/crypto/internal/fips140test/cast_test.go` (`allCASTs`, lines 39-65).
+- Primary reference: `https://tip.golang.org/src/crypto/internal/fips140test/cast_test.go` (`allCASTs`, lines 39-65).
 - Optional local path (if Go is installed): `$(go env GOROOT)/src/crypto/internal/fips140test/cast_test.go`.
 
 Steps:
@@ -302,15 +309,22 @@ GODEBUG=failfipscast=TLSv1.2-SHA2-256,fips140=on ./clickhouse-backup/clickhouse-
 
 Expected result:
 - Each command exits with non-zero code.
-- Output explicitly indicates startup self-test failure (contains `fips`, `cast`, or `panic`).
+- Output contains explicit startup self-test failure text:
+  - `fatal error: FIPS 140-3 self-test failed: SHA2-256: simulated CAST failure` for step 2.
+  - `fatal error: FIPS 140-3 self-test failed: TLSv1.2-SHA2-256: simulated CAST failure` for step 3.
+- TLSv1.2 CAST failure output also includes stack-trace marker `crypto/internal/fips140/.../tls12/cast.go`.
 - A zero exit code for either command is a test failure.
-- This manual check is covered by automated scenario `failfipscast_known_answer_tests`.
+This manual check is covered by automated scenario `failfipscast_known_answer_tests`.
 
 ## Test Case 7
 
 ### Validate inbound TLS cipher policy with `openssl s_client` (FIPS-compatible vs non-compatible)
 
-Goal: verify `clickhouse-backup-fips` TLS endpoint accepts FIPS-compatible ciphers and rejects non-compatible ciphers. Validate both TLSv1.3 (`-ciphersuites`) and TLSv1.2 (`-cipher`) client options.
+Goal: verify inbound TLS policy of `clickhouse-backup-fips` API server using `openssl s_client`: FIPS-compatible cipher handshakes are allowed and non-compatible cipher handshakes are rejected (TLSv1.3 `-ciphersuites`, TLSv1.2 `-cipher`).
+Role mapping:
+- TLS server under test: `clickhouse-backup-fips server` (API endpoint on `:7172`).
+- TLS client used to probe policy: `openssl s_client`.
+Tool choice: use `s_client` here because this is an inbound policy check. Test Case 8 uses `openssl s_server` for outbound checks where `clickhouse-backup-fips` is the TLS client.
 
 Steps:
 
@@ -386,6 +400,9 @@ Expected result:
 
 Goal: verify `clickhouse-backup-fips` rejects a remote TLS server that offers only non-FIPS ciphers.  
 Scope difference from Test Case 7: Test Case 7 validates inbound policy on `clickhouse-backup-fips server`; this test validates outbound policy when `clickhouse-backup-fips` connects to remote storage over TLS.
+Role mapping:
+- TLS client under test: `clickhouse-backup-fips` (`list remote` against HTTPS S3 endpoint).
+- TLS server used to control offered cipher policy: `openssl s_server`.
 
 Steps:
 
@@ -416,7 +433,7 @@ Expected result:
 - Connection to compatible `openssl s_server` cipher is not rejected by TLS negotiation.
 - Connection to non-compatible `openssl s_server` cipher fails at TLS negotiation (`handshake failure`, `no shared cipher`, or equivalent TLS error).
 - Test is covered by automated scenario `outbound_tls_cipher_negotiation`.
-- If AWS SDK endpoint rules block custom FIPS endpoint usage (`custom endpoint cannot be combined with fips`), scenario is skipped with explicit reason.
+- If AWS SDK endpoint rules block custom FIPS endpoint usage (`custom endpoint cannot be combined with fips`), scenario is skipped with explicit reason; this is an environment/platform limitation, not a cipher-policy failure.
 
 ## Final cleanup (local)
 
