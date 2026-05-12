@@ -270,6 +270,39 @@ Expected result:
 - Failure is explicit (`panic: fips140: verification mismatch`) and process exits non-zero.
 - Behavior matches automated TestFlows scenario `checksum_tamper_panics`.
 
+## Test Case 6
+
+### Simulate CAST self-test failures using `GODEBUG=failfipscast=...`
+
+Goal: verify FIPS startup self-tests (CAST) are enforced by forcing specific CAST checks to fail and confirming `clickhouse-backup-fips` does not start successfully.
+
+Steps:
+
+1. Build FIPS-compatible binary:
+
+```bash
+source ~/venv/qa/bin/activate
+make clean build-race-fips-docker
+```
+
+2. Force failure of CAST `SHA2-256`:
+
+```bash
+GODEBUG=failfipscast=SHA2-256,fips140=on ./clickhouse-backup/clickhouse-backup-race-fips --version
+```
+
+3. Force failure of CAST `TLSv1.2-SHA2-256`:
+
+```bash
+GODEBUG=failfipscast=TLSv1.2-SHA2-256,fips140=on ./clickhouse-backup/clickhouse-backup-race-fips --version
+```
+
+Expected result:
+- Each command exits with non-zero code.
+- Output explicitly indicates startup self-test failure (contains `fips`, `cast`, or `panic`).
+- A zero exit code for either command is a test failure.
+- This manual check is covered by automated scenario `failfipscast_known_answer_tests`.
+
 ## Final cleanup (local)
 
 Goal: avoid docker garbage and prevent leftover test containers from starting later.
