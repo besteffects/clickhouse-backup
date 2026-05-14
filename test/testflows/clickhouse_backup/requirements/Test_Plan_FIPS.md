@@ -577,4 +577,6 @@ Use `docker volume prune -f` only if you are sure you do not need any Docker vol
 ```bash
 rm -f /tmp/ch-backup-fips.yml
 rm -f /tmp/ch-backup-nonfips.yml
+rm -f /tmp/ch-fips.xml
+rm -rf /tmp/ch-fips-certs
 ```
