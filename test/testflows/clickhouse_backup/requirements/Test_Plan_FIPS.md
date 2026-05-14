@@ -542,6 +542,102 @@ Expected result:
 - Test is covered by automated scenario `outbound_tls_cipher_negotiation`.
 - If AWS SDK endpoint rules block custom FIPS endpoint usage (`custom endpoint cannot be combined with fips`), scenario is skipped with explicit reason; this is an environment/platform limitation, not a cipher-policy failure.
 
+## Optional extension for Test Case 2a (manual negative TLS)
+
+Goal: verify strict FIPS runtime in `clickhouse-backup-fips` rejects non-FIPS TLS profile on non-FIPS ClickHouse image (`25.8.16.10002.altinitystable`).
+
+Steps:
+
+1. Create TLS certs used by ClickHouse in container:
+
+```bash
+mkdir -p /tmp/ch-fips-certs
+openssl req -x509 -nodes -newkey rsa:4096 -days 365 \
+  -keyout /tmp/ch-fips-certs/server.key \
+  -out /tmp/ch-fips-certs/server.crt \
+  -subj "/CN=localhost"
+chmod 755 /tmp/ch-fips-certs
+chmod 644 /tmp/ch-fips-certs/server.crt /tmp/ch-fips-certs/server.key
+```
+
+2. Create non-FIPS TLS ClickHouse config (`/tmp/ch-fips.xml`):
+
+```bash
+cat > /tmp/ch-fips.xml <<'EOF'
+<clickhouse>
+  <https_port>8443</https_port>
+  <tcp_port_secure>9440</tcp_port_secure>
+  <openSSL>
+    <server>
+      <certificateFile>/etc/clickhouse-server/certs/server.crt</certificateFile>
+      <privateKeyFile>/etc/clickhouse-server/certs/server.key</privateKeyFile>
+      <cipherList>ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:AES128-SHA</cipherList>
+      <cipherSuites>TLS_CHACHA20_POLY1305_SHA256</cipherSuites>
+      <disableProtocols>sslv2,sslv3</disableProtocols>
+      <verificationMode>none</verificationMode>
+    </server>
+  </openSSL>
+</clickhouse>
+EOF
+```
+
+3. Run non-FIPS ClickHouse with this TLS profile:
+
+```bash
+docker rm -f ch-fips 2>/dev/null || true
+docker run -d --name ch-fips \
+  -p 8443:8443 -p 9440:9440 \
+  -e CLICKHOUSE_USER=backup \
+  -e CLICKHOUSE_PASSWORD=backup123 \
+  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+  -v /tmp/ch-fips.xml:/etc/clickhouse-server/config.d/fips.xml:ro \
+  -v /tmp/ch-fips-certs:/etc/clickhouse-server/certs:ro \
+  altinity/clickhouse-server:25.8.16.10002.altinitystable
+```
+
+4. Create client config that uses secure native port (`9440`):
+
+```bash
+cat > /tmp/ch-backup-fips.yml <<'EOF'
+general:
+  remote_storage: none
+clickhouse:
+  host: 127.0.0.1
+  port: 9440
+  username: backup
+  password: "backup123"
+  secure: true
+  skip_verify: true
+EOF
+```
+
+5. Start manual negative probe with `openssl s_server` (mandatory for this check):
+
+```bash
+docker rm -f ch-fips 2>/dev/null || true
+openssl s_server -accept 9440 \
+  -cert /tmp/ch-fips-certs/server.crt \
+  -key /tmp/ch-fips-certs/server.key \
+  -tls1_2 \
+  -cipher 'ECDHE-RSA-CHACHA20-POLY1305' \
+  -state -msg -tlsextdebug
+```
+
+6. In a separate terminal, use strict FIPS runtime and verify TLS connection is rejected:
+
+```bash
+GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-fips.yml tables
+```
+
+Note: this probe must run without ClickHouse bound to `9440` because `openssl s_server` occupies this port.
+
+Expected result:
+- This server profile is intentionally non-FIPS and is for negative testing only.
+- In strict mode, `clickhouse-backup-fips` should fail to negotiate TLS and not return normal `tables` output.
+- The failure is expected specifically because the server offers non-FIPS cipher `ECDHE-RSA-CHACHA20-POLY1305`.
+- Typical `openssl s_server` output includes `fatal handshake_failure` and `no shared cipher`.
+- Typical `clickhouse-backup-fips` output includes `remote error: tls: handshake failure` during ping/retry loop.
+
 ## Final cleanup (local)
 
 Goal: avoid docker garbage and prevent leftover test containers from starting later.
