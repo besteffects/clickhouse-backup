@@ -109,7 +109,7 @@ EOF
 Optional stricter runtime mode:
 
 ```bash
-GODEBUG=fips140=on ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-fips.yml tables
+GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-fips.yml tables
 ```
 
 Expected result:
@@ -162,6 +162,7 @@ export CLICKHOUSE_TESTS_DIR="$(pwd)/test/testflows/clickhouse_backup"
 export CLICKHOUSE_BACKUP_FIPS_BINARY="$(pwd)/clickhouse-backup/clickhouse-backup-race-fips"
 CLICKHOUSE_IMAGE=altinity/clickhouse-server \
 CLICKHOUSE_VERSION=25.3.8.30001.altinityfips \
+GODEBUG=fips140=only \
 python3 test/testflows/clickhouse_backup/regression.py \
   --only "/clickhouse backup/*" \
   --log "test/testflows/ch_backup25.3.8.30001.altinityfips.fips.raw.log" \
@@ -185,6 +186,7 @@ Expected result:
 - All `/clickhouse backup/*` scenarios run with FIPS-compatible `clickhouse-backup` against FIPS-compatible ClickHouse image.
 - Logs are available in `test/testflows/`.
 - If optional step `3` is executed, both ClickHouse containers report `/etc/clickhouse-server/config.d/fips.xml` present.
+- Run executes with `GODEBUG=fips140=only` (strict FIPS runtime mode).
 
 ## Test Case 2a
 
@@ -244,7 +246,7 @@ Note: `secure: false` is intentional in this local connectivity smoke check. TLS
 ```
 
 Expected result:
-- `tables` command succeeds against non-FIPS ClickHouse server.GOFIPS
+- `tables` command succeeds against non-FIPS ClickHouse server.
 
 ## Test Case 2b
 
@@ -274,6 +276,7 @@ export CLICKHOUSE_BACKUP_FIPS_BINARY="$(pwd)/clickhouse-backup/clickhouse-backup
 ```bash
 CLICKHOUSE_IMAGE=altinity/clickhouse-server \
 CLICKHOUSE_VERSION=25.8.16.10002.altinitystable \
+GODEBUG=fips140=only \
 python3 test/testflows/clickhouse_backup/regression.py \
   --only "/clickhouse backup/*" \
   --log "test/testflows/ch_backup25.8.16.10002.altinitystable.fips.raw.log" \
@@ -283,6 +286,7 @@ python3 test/testflows/clickhouse_backup/regression.py \
 Expected result:
 - All `/clickhouse backup/*` scenarios execute with FIPS-compatible `clickhouse-backup` against non-FIPS ClickHouse image.
 - Any skips/failures are explicit and can be compared against Test Case 1b.
+- Run executes with `GODEBUG=fips140=only` (strict FIPS runtime mode).
 
 ## Test Case 3
 
