@@ -8,6 +8,9 @@ Goal: verify local `clickhouse-backup` FIPS binary can connect to FIPS-compatibl
 
 Steps:
 
+Minimal path: run steps `1 -> 2 -> 3 -> 5 -> 6`.  
+Step `4` is diagnostic-only (use it when you need to prove effective merged ClickHouse config).
+
 1. Build FIPS-compatible `clickhouse-backup`:
 
 ```bash
@@ -15,19 +18,73 @@ source ~/venv/qa/bin/activate
 make clean build-race-fips-docker
 ```
 
-2. Start FIPS-compatible ClickHouse server container:
+2. Create TLS cert files and FIPS ClickHouse config XML (`/etc/clickhouse-server/config.d/fips.xml`):
+
+```bash
+mkdir -p /tmp/ch-fips-certs
+openssl req -x509 -nodes -newkey rsa:4096 -days 365 \
+  -keyout /tmp/ch-fips-certs/server.key \
+  -out /tmp/ch-fips-certs/server.crt \
+  -subj "/CN=localhost"
+chmod 755 /tmp/ch-fips-certs
+chmod 644 /tmp/ch-fips-certs/server.crt /tmp/ch-fips-certs/server.key
+
+cat > /tmp/ch-fips.xml <<'EOF'
+<clickhouse>
+  <!-- needs to be clarified. The altinity doc contains info that these ports have to be disabled-->
+  <!-- <http_port remove="1"/> -->
+  <!-- <tcp_port remove="1"/> -->
+  <!-- <mysql_port remove="1"/> -->
+  <!-- <postgresql_port remove="1"/> -->
+  <!-- <grpc_port remove="1"/> -->
+
+  <!-- enable secure listeners -->
+  <https_port>8443</https_port>
+  <tcp_port_secure>9440</tcp_port_secure>
+
+  <openSSL>
+    <server>
+      <certificateFile>/etc/clickhouse-server/certs/server.crt</certificateFile>
+      <privateKeyFile>/etc/clickhouse-server/certs/server.key</privateKeyFile>
+      <cipherList>ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-GCM-SHA384</cipherList>
+      <cipherSuites>TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384</cipherSuites>
+      <loadDefaultCAFile>true</loadDefaultCAFile>
+      <cacheSessions>true</cacheSessions>
+      <preferServerCiphers>true</preferServerCiphers>
+      <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1</disableProtocols>
+      <!-- use 'strict' with trusted CA in production -->
+      <verificationMode>relaxed</verificationMode>
+    </server>
+  </openSSL>
+</clickhouse>
+EOF
+```
+
+3. Start FIPS-compatible ClickHouse server container with mounted config:
 
 ```bash
 docker rm -f ch-fips 2>/dev/null || true
 docker run -d --name ch-fips \
-  -p 9000:9000 -p 8123:8123 \
+  -p 8443:8443 -p 9440:9440 \
   -e CLICKHOUSE_USER=backup \
   -e CLICKHOUSE_PASSWORD=backup123 \
   -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+  -v /tmp/ch-fips.xml:/etc/clickhouse-server/config.d/fips.xml:ro \
+  -v /tmp/ch-fips-certs:/etc/clickhouse-server/certs:ro \
   altinity/clickhouse-server:25.3.8.30001.altinityfips
 ```
 
-3. Create minimal local config for `clickhouse-backup-fips`:
+4. Optional diagnostics: print effective ClickHouse server configuration:
+
+```bash
+docker exec ch-fips sh -c 'echo "===== /etc/clickhouse-server/config.xml ====="; sed -n "1,220p" /etc/clickhouse-server/config.xml'
+docker exec ch-fips sh -c 'for f in /etc/clickhouse-server/config.d/*.xml; do [ -f "$f" ] && echo "===== $f =====" && sed -n "1,220p" "$f"; done'
+docker exec ch-fips sh -c 'grep -R -n "<http_port>\\|<tcp_port>\\|<https_port>\\|<tcp_port_secure>\\|<mysql_port>\\|<postgresql_port>\\|<grpc_port>" /etc/clickhouse-server'
+docker exec ch-fips sh -c 'echo "===== /var/lib/clickhouse/preprocessed_configs/config.xml ====="; grep -n "<http_port>\\|<tcp_port>\\|<https_port>\\|<tcp_port_secure>\\|<mysql_port>\\|<postgresql_port>\\|<grpc_port>" /var/lib/clickhouse/preprocessed_configs/config.xml'
+docker exec ch-fips sh -c 'ss -ltn | grep -E ":8443|:9440|:8123|:9000" || true'
+```
+
+5. Create minimal local config for `clickhouse-backup-fips` (native TLS):
 
 ```bash
 cat > /tmp/ch-backup-fips.yml <<'EOF'
@@ -35,14 +92,15 @@ general:
   remote_storage: none
 clickhouse:
   host: 127.0.0.1
-  port: 9000
+  port: 9440
   username: backup
   password: "backup123"
-  secure: false
+  secure: true
+  skip_verify: true
 EOF
 ```
 
-4. Verify connectivity:
+6. Verify connectivity:
 
 ```bash
 ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-fips.yml tables
@@ -55,38 +113,53 @@ GODEBUG=fips140=on ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-ba
 ```
 
 Expected result:
-- `tables` command succeeds without authentication/connection errors.
+- `tables` command succeeds over secure native port (`9440`) without authentication/connection errors.
+- If step `4` is executed, output confirms secure ports are enabled via `/etc/clickhouse-server/config.d/fips.xml`.
 
 ## Test Case 1b
 
 ### Automation: FIPS-compatible `clickhouse-backup` vs FIPS-compatible ClickHouse Server
 
-Goal: run automated scenarios in TestFlows using FIPS-compatible `clickhouse-backup` against FIPS-compatible ClickHouse image.
+Goal: run automated scenarios in TestFlows using FIPS-compatible `clickhouse-backup` against FIPS-compatible ClickHouse image with explicit FIPS server config (`config.d/fips.xml`).
 
 Steps:
 
-1. Build binaries required by TestFlows:
+Minimum reproducible path:
+
+1. Create TestFlows ClickHouse FIPS override file (`test/testflows/clickhouse_backup/configs/clickhouse/config.d/fips.xml`):
+
+```bash
+cat > test/testflows/clickhouse_backup/configs/clickhouse/config.d/fips.xml <<'EOF'
+<clickhouse>
+  <!-- needs to be clarified -->
+  <!-- <http_port remove="1"/> -->
+  <!-- <tcp_port remove="1"/> -->
+  <!-- <mysql_port remove="1"/> -->
+  <!-- <postgresql_port remove="1"/> -->
+  <!-- <grpc_port remove="1"/> -->
+
+  <https_port>8443</https_port>
+  <tcp_port_secure>9440</tcp_port_secure>
+  <openSSL>
+    <server>
+      <cipherList>ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-GCM-SHA384</cipherList>
+      <cipherSuites>TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384</cipherSuites>
+      <preferServerCiphers>true</preferServerCiphers>
+      <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1</disableProtocols>
+      <verificationMode>relaxed</verificationMode>
+    </server>
+  </openSSL>
+</clickhouse>
+EOF
+```
+
+2. Build binaries and run TestFlows with FIPS binary + FIPS ClickHouse image:
 
 ```bash
 source ~/venv/qa/bin/activate
 make clean build-race-docker build-race-fips-docker
-ls -l clickhouse-backup/clickhouse-backup-race clickhouse-backup/clickhouse-backup-race-fips
-```
-
-This test case runs all `/clickhouse backup/*` scenarios while forcing the FIPS
-binary via `CLICKHOUSE_BACKUP_FIPS_BINARY`.
-
-2. Set TestFlows context:
-
-```bash
 export CLICKHOUSE_TESTS_DIR="$(pwd)/test/testflows/clickhouse_backup"
 export CLICKHOUSE_BACKUP_FIPS_BINARY="$(pwd)/clickhouse-backup/clickhouse-backup-race-fips"
-export RUN_TESTS="/clickhouse backup/*"
-```
-
-3. Run FIPS TestFlows against FIPS-compatible ClickHouse image:
-
-```bash
 CLICKHOUSE_IMAGE=altinity/clickhouse-server \
 CLICKHOUSE_VERSION=25.3.8.30001.altinityfips \
 python3 test/testflows/clickhouse_backup/regression.py \
@@ -95,9 +168,23 @@ python3 test/testflows/clickhouse_backup/regression.py \
   |& tee "test/testflows/ch_backup25.3.8.30001.altinityfips.fips.console.log"
 ```
 
+3. Optional verification (prove `fips.xml` was mounted in ClickHouse containers):
+
+```bash
+docker exec clickhouse1 sh -c 'test -f /etc/clickhouse-server/config.d/fips.xml && echo "fips.xml present on clickhouse1"'
+docker exec clickhouse2 sh -c 'test -f /etc/clickhouse-server/config.d/fips.xml && echo "fips.xml present on clickhouse2"'
+```
+
+4. Remove temporary TestFlows FIPS override file after the run:
+
+```bash
+rm -f test/testflows/clickhouse_backup/configs/clickhouse/config.d/fips.xml
+```
+
 Expected result:
-- FIPS suite runs; optional scenarios can be skipped with explicit reasons.
+- All `/clickhouse backup/*` scenarios run with FIPS-compatible `clickhouse-backup` against FIPS-compatible ClickHouse image.
 - Logs are available in `test/testflows/`.
+- If optional step `3` is executed, both ClickHouse containers report `/etc/clickhouse-server/config.d/fips.xml` present.
 
 ## Test Case 2a
 
@@ -126,7 +213,14 @@ docker run -d --name ch-nonfips \
   altinity/clickhouse-server:25.8.16.10002.altinitystable
 ```
 
-3. Create local config for `clickhouse-backup-fips`:
+3. Print ClickHouse server configuration files used in the container:
+
+```bash
+docker exec ch-nonfips sh -c 'echo "===== /etc/clickhouse-server/config.xml ====="; sed -n "1,220p" /etc/clickhouse-server/config.xml'
+docker exec ch-nonfips sh -c 'for f in /etc/clickhouse-server/config.d/*.xml; do [ -f "$f" ] && echo "===== $f =====" && sed -n "1,220p" "$f"; done'
+```
+
+4. Create local config for `clickhouse-backup-fips`:
 
 ```bash
 cat > /tmp/ch-backup-nonfips.yml <<'EOF'
@@ -134,21 +228,23 @@ general:
   remote_storage: none
 clickhouse:
   host: 127.0.0.1
-  port: 9001
+  port: 9000
   username: backup
   password: "backup123"
   secure: false
 EOF
 ```
 
-4. Verify connectivity:
+Note: `secure: false` is intentional in this local connectivity smoke check. TLS/cipher policy enforcement is validated separately in Test Case 7 (inbound) and Test Case 8 (outbound).
+
+5. Verify connectivity:
 
 ```bash
 ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-nonfips.yml tables
 ```
 
 Expected result:
-- `tables` command succeeds against non-FIPS ClickHouse server.
+- `tables` command succeeds against non-FIPS ClickHouse server.GOFIPS
 
 ## Test Case 2b
 
@@ -325,6 +421,13 @@ Role mapping:
 - TLS server under test: `clickhouse-backup-fips server` (API endpoint on `:7172`).
 - TLS client used to probe policy: `openssl s_client`.
 Tool choice: use `s_client` here because this is an inbound policy check. Test Case 8 uses `openssl s_server` for outbound checks where `clickhouse-backup-fips` is the TLS client.
+
+Cipher list source:
+- Policy baseline: Altinity FIPS-compatible ClickHouse guidance (TLSv1.2/TLSv1.3 and FIPS-approved ciphers).
+- Test baseline used by Altinity regression tests:
+  - `ssl_server/tests/common.py` (`fips_140_3_compatible_tlsv1_2_cipher_suites`, `fips_140_3_compatible_tlsv1_3_cipher_suites`, `all_ciphers`, `all_tlsv1_3_ciphers`)
+  - `ssl_keeper/tests/fips_ssl.py` (`fips_compatible_tlsv1_2_cipher_suites`, `all_ciphers`)
+- This plan uses that same baseline style: explicit positive allowlist checks and explicit negative denylist checks.
 
 Steps:
 
