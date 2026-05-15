@@ -254,6 +254,102 @@ Expected result:
 
 ---
 
+## Test Case 3
+
+Validate outbound S3 connectivity behavior in strict FIPS mode.
+
+Official config note:
+- `clickhouse-backup` uses configurable `s3.endpoint` (see `ReadMe.md`, `s3.endpoint`).
+- Standard HTTPS endpoint uses port `443` by default.
+- In FIPS build, custom S3 endpoint + FIPS mode can be rejected by AWS endpoint rules before TLS handshake.
+
+### Setup 3.1 Shared prerequisites
+
+```bash
+docker rm -f ch-for-api 2>/dev/null || true
+docker run -d --name ch-for-api \
+  -p 9000:9000 -p 8123:8123 \
+  -e CLICKHOUSE_USER=backup \
+  -e CLICKHOUSE_PASSWORD=backup123 \
+  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+  altinity/clickhouse-server:25.8.16.10002.altinitystable
+ss -ltn | grep -E ':9000\b' >/dev/null || {
+  echo "ClickHouse is not listening on 127.0.0.1:9000"
+}
+```
+
+Expected:
+- ClickHouse backend is listening on `127.0.0.1:9000`.
+
+Setup is complete. Execute the following tests:
+
+### Test 3.1 Positive test: real S3 endpoint path in strict FIPS mode
+
+Create config (terminal #2):
+
+```bash
+cat > /tmp/ch-backup-s3-real.yml <<'EOF'
+general:
+  remote_storage: s3
+clickhouse:
+  host: 127.0.0.1
+  port: 9000
+  username: backup
+  password: "backup123"
+  secure: false
+s3:
+  access_key: "<AWS_ACCESS_KEY_ID>"
+  secret_key: "<AWS_SECRET_ACCESS_KEY>"
+  bucket: "<AWS_BUCKET>"
+  region: "us-east-1"
+  force_path_style: false
+  disable_ssl: false
+  disable_cert_verification: false
+EOF
+
+GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-s3-real.yml list remote
+```
+
+Expected result:
+- ClickHouse ping succeeds (`tcp://127.0.0.1:9000`).
+- No `S3 ResolveEndpoint ... custom endpoint cannot be combined with FIPS` error.
+- Command reaches remote-list stage (actual list/auth errors depend on bucket credentials and permissions).
+
+### Test 3.2 Negative test: custom S3 endpoint rejected in strict FIPS mode
+
+Create config and run (terminal #2):
+
+```bash
+cat > /tmp/ch-backup-s3-custom.yml <<'EOF'
+general:
+  remote_storage: s3
+clickhouse:
+  host: 127.0.0.1
+  port: 9000
+  username: backup
+  password: "backup123"
+  secure: false
+s3:
+  access_key: test
+  secret_key: test
+  bucket: test
+  endpoint: https://localhost:9443
+  region: us-east-1
+  force_path_style: true
+  disable_ssl: false
+  disable_cert_verification: true
+EOF
+
+GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-s3-custom.yml list remote
+```
+
+Expected result:
+- ClickHouse ping succeeds (`tcp://127.0.0.1:9000`).
+- Command fails before TLS handshake with endpoint-rule error:
+  - `S3 ResolveEndpoint: endpoint rule error, A custom endpoint cannot be combined with FIPS`.
+
+---
+
 ## Cleanup
 
 ```bash
@@ -262,6 +358,8 @@ pkill -f "openssl s_server -accept 9440" 2>/dev/null || true
 docker rm -f ch-for-api 2>/dev/null || true
 docker rm -f ch-fips 2>/dev/null || true
 rm -f /tmp/ch-backup-fips.yml
+rm -f /tmp/ch-backup-s3-real.yml
+rm -f /tmp/ch-backup-s3-custom.yml
 rm -rf /tmp/chb-fips-tls
 rm -rf /tmp/ch-fips-certs
 ```
