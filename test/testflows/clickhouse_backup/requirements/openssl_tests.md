@@ -118,9 +118,9 @@ GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-
 ```
 
 Expected result:
-- Terminal #2: command fails TLS negotiation and typically shows repeating ping/retry warnings, for example `remote error: tls: handshake failure, will wait 5 second to reconnect`.
-- Terminal #2: `warning: GOCOVERDIR not set, no coverage data emitted` is acceptable and not a test failure signal.
-- Terminal #1: `openssl s_server` output typically includes `fatal handshake_failure`, `no shared cipher`, `SSL_accept:error in error`, and `CONNECTION CLOSED`.
+- Command fails TLS negotiation.
+- Typical client error: `remote error: tls: handshake failure`.
+- Typical `openssl s_server` output: `fatal handshake_failure` and/or `no shared cipher`.
 
 ---
 
@@ -256,12 +256,12 @@ Expected result:
 
 ## Test Case 3
 
-Validate outbound S3 connectivity behavior in strict FIPS mode.
+Validate that `clickhouse-backup-fips` enforces outbound TLS policy for S3-style connections in strict FIPS mode.
 
-Official config note:
-- `clickhouse-backup` uses configurable `s3.endpoint` (see `ReadMe.md`, `s3.endpoint`).
-- Standard HTTPS endpoint uses port `443` by default.
-- In FIPS build, custom S3 endpoint + FIPS mode can be rejected by AWS endpoint rules before TLS handshake.
+Scope:
+- Real S3 connectivity is not required.
+- The check targets TLS/FIPS enforcement during outbound connection attempts.
+- `openssl s_server` is used as a controllable HTTPS endpoint that is not a real S3 API.
 
 ### Setup 3.1 Shared prerequisites
 
@@ -276,77 +276,113 @@ docker run -d --name ch-for-api \
 ss -ltn | grep -E ':9000\b' >/dev/null || {
   echo "ClickHouse is not listening on 127.0.0.1:9000"
 }
+
+# Ensure backup has at least one user table, otherwise create_remote exits with
+# "no tables for backup" before any remote S3/TLS connection is attempted.
+docker exec ch-for-api clickhouse-client \
+  --user backup --password backup123 \
+  -q "CREATE TABLE IF NOT EXISTS default.fips_s3_probe (id UInt8) ENGINE=MergeTree ORDER BY id"
+docker exec ch-for-api clickhouse-client \
+  --user backup --password backup123 \
+  -q "INSERT INTO default.fips_s3_probe VALUES (1)"
 ```
 
 Expected:
 - ClickHouse backend is listening on `127.0.0.1:9000`.
+- `default.fips_s3_probe` exists with at least one row.
 
-Setup is complete. Execute the following tests:
+### Setup 3.2 Prepare local TLS endpoint for S3 URL emulation
 
-### Test 3.1 Positive test: real S3 endpoint path in strict FIPS mode
-
-Create config (terminal #2):
+Run in terminal #1:
 
 ```bash
-cat > /tmp/ch-backup-s3-real.yml <<'EOF'
-general:
-  remote_storage: s3
-clickhouse:
-  host: 127.0.0.1
-  port: 9000
-  username: backup
-  password: "backup123"
-  secure: false
-s3:
-  access_key: "<AWS_ACCESS_KEY_ID>"
-  secret_key: "<AWS_SECRET_ACCESS_KEY>"
-  bucket: "<AWS_BUCKET>"
-  region: "us-east-1"
-  force_path_style: false
-  disable_ssl: false
-  disable_cert_verification: false
-EOF
+TMP_S3_TLS_DIR=/tmp/ch-s3-fips-certs
+rm -rf "$TMP_S3_TLS_DIR"
+mkdir -p "$TMP_S3_TLS_DIR"
+openssl req -x509 -nodes -newkey rsa:4096 -days 365 \
+  -keyout "$TMP_S3_TLS_DIR/server.key" \
+  -out "$TMP_S3_TLS_DIR/server.crt" \
+  -subj "/CN=localhost"
+chmod 755 "$TMP_S3_TLS_DIR"
+chmod 644 "$TMP_S3_TLS_DIR/server.crt" "$TMP_S3_TLS_DIR/server.key"
 
-GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-s3-real.yml list remote
+pkill -f "openssl s_server -accept 9443" 2>/dev/null || true
+openssl s_server -accept 9443 \
+  -cert "$TMP_S3_TLS_DIR/server.crt" \
+  -key "$TMP_S3_TLS_DIR/server.key" \
+  -tls1_2 \
+  -cipher 'ECDHE-RSA-CHACHA20-POLY1305' \
+  -state -msg -tlsextdebug
 ```
 
-Expected result:
-- ClickHouse ping succeeds (`tcp://127.0.0.1:9000`).
-- No `S3 ResolveEndpoint ... custom endpoint cannot be combined with FIPS` error.
-- Command reaches remote-list stage (actual list/auth errors depend on bucket credentials and permissions).
+Expected:
+- `openssl s_server` waits for inbound TLS on `:9443` and prints `ACCEPT`.
+- Server offers only non-FIPS cipher profile for negative enforcement check.
 
-### Test 3.2 Negative test: custom S3 endpoint rejected in strict FIPS mode
+Setup is complete. Execute the following tests.
 
-Create config and run (terminal #2):
+### Test 3.1 Negative test: outbound S3 attempt is rejected by strict FIPS TLS policy
+
+Create config and run in terminal #2:
 
 ```bash
-cat > /tmp/ch-backup-s3-custom.yml <<'EOF'
+cat > /tmp/ch-backup-s3-openssl.yml <<'EOF'
 general:
   remote_storage: s3
+
 clickhouse:
   host: 127.0.0.1
   port: 9000
   username: backup
   password: "backup123"
   secure: false
+
 s3:
   access_key: test
   secret_key: test
   bucket: test
-  endpoint: https://localhost:9443
   region: us-east-1
+  endpoint: https://127.0.0.1:9443
   force_path_style: true
   disable_ssl: false
   disable_cert_verification: true
 EOF
 
-GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-s3-custom.yml list remote
+GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-s3-openssl.yml create_remote --schema "fips-s3-$(date +%s)"
 ```
 
 Expected result:
 - ClickHouse ping succeeds (`tcp://127.0.0.1:9000`).
-- Command fails before TLS handshake with endpoint-rule error:
-  - `S3 ResolveEndpoint: endpoint rule error, A custom endpoint cannot be combined with FIPS`.
+- `clickhouse-backup-fips` attempts outbound HTTPS connection to the configured S3 endpoint (`127.0.0.1:9443`).
+- TLS negotiation is rejected due to cipher policy (`handshake failure`, `no shared cipher`, or equivalent TLS error).
+- `openssl s_server` output in terminal #1 shows failed handshake details, typically including `no shared cipher` and `fatal handshake_failure`.
+- `no tables for backup` should not appear; if it does, rerun Setup 3.1.
+
+### Test 3.2 Optional control test: outbound S3 attempt is not rejected by TLS policy with compatible ciphers
+
+Restart terminal #1 TLS endpoint with FIPS-compatible ciphers:
+
+```bash
+pkill -f "openssl s_server -accept 9443" 2>/dev/null || true
+openssl s_server -accept 9443 \
+  -cert /tmp/ch-s3-fips-certs/server.crt \
+  -key /tmp/ch-s3-fips-certs/server.key \
+  -tls1_2 \
+  -cipher 'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256' \
+  -state -msg -tlsextdebug
+```
+
+Run in terminal #2:
+
+```bash
+GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-s3-openssl.yml create_remote --schema "fips-s3-ctrl-$(date +%s)"
+```
+
+Expected result:
+- ClickHouse ping succeeds (`tcp://127.0.0.1:9000`).
+- TLS-policy rejection should not be the failure reason (no `handshake failure` / `no shared cipher` as primary error).
+- Because `openssl s_server` is not a real S3 API, command may still fail later with protocol/auth/content errors; that is acceptable for this control check.
+- `no tables for backup` should not appear; if it does, rerun Setup 3.1.
 
 ---
 
@@ -355,11 +391,12 @@ Expected result:
 ```bash
 pkill -f "clickhouse-backup.*server" 2>/dev/null || true
 pkill -f "openssl s_server -accept 9440" 2>/dev/null || true
+pkill -f "openssl s_server -accept 9443" 2>/dev/null || true
 docker rm -f ch-for-api 2>/dev/null || true
 docker rm -f ch-fips 2>/dev/null || true
 rm -f /tmp/ch-backup-fips.yml
-rm -f /tmp/ch-backup-s3-real.yml
-rm -f /tmp/ch-backup-s3-custom.yml
+rm -f /tmp/ch-backup-s3-openssl.yml
 rm -rf /tmp/chb-fips-tls
 rm -rf /tmp/ch-fips-certs
+rm -rf /tmp/ch-s3-fips-certs
 ```
