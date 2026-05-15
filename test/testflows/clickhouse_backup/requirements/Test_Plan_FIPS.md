@@ -21,6 +21,7 @@ make clean build-race-fips-docker
 2. Create TLS cert files and FIPS ClickHouse config XML (`/etc/clickhouse-server/config.d/fips.xml`):
 
 ```bash
+rm -rf /tmp/ch-fips-certs
 mkdir -p /tmp/ch-fips-certs
 openssl req -x509 -nodes -newkey rsa:4096 -days 365 \
   -keyout /tmp/ch-fips-certs/server.key \
@@ -29,14 +30,15 @@ openssl req -x509 -nodes -newkey rsa:4096 -days 365 \
 chmod 755 /tmp/ch-fips-certs
 chmod 644 /tmp/ch-fips-certs/server.crt /tmp/ch-fips-certs/server.key
 
+rm -f /tmp/ch-fips.xml
 cat > /tmp/ch-fips.xml <<'EOF'
 <clickhouse>
-  <!-- needs to be clarified. The altinity doc contains info that these ports have to be disabled-->
-  <!-- <http_port remove="1"/> -->
-  <!-- <tcp_port remove="1"/> -->
-  <!-- <mysql_port remove="1"/> -->
-  <!-- <postgresql_port remove="1"/> -->
-  <!-- <grpc_port remove="1"/> -->
+  <!-- disable insecure listeners -->
+  <http_port remove="1"/>
+  <tcp_port remove="1"/>
+  <mysql_port remove="1"/>
+  <postgresql_port remove="1"/>
+  <grpc_port remove="1"/>
 
   <!-- enable secure listeners -->
   <https_port>8443</https_port>
@@ -87,6 +89,7 @@ docker exec ch-fips sh -c 'ss -ltn | grep -E ":8443|:9440|:8123|:9000" || true'
 5. Create minimal local config for `clickhouse-backup-fips` (native TLS):
 
 ```bash
+rm -f /tmp/ch-backup-fips.yml
 cat > /tmp/ch-backup-fips.yml <<'EOF'
 general:
   remote_storage: none
@@ -129,14 +132,15 @@ Minimum reproducible path:
 1. Create TestFlows ClickHouse FIPS override file (`test/testflows/clickhouse_backup/configs/clickhouse/config.d/fips.xml`):
 
 ```bash
+rm -f test/testflows/clickhouse_backup/configs/clickhouse/config.d/fips.xml
 cat > test/testflows/clickhouse_backup/configs/clickhouse/config.d/fips.xml <<'EOF'
 <clickhouse>
-  <!-- needs to be clarified -->
-  <!-- <http_port remove="1"/> -->
-  <!-- <tcp_port remove="1"/> -->
-  <!-- <mysql_port remove="1"/> -->
-  <!-- <postgresql_port remove="1"/> -->
-  <!-- <grpc_port remove="1"/> -->
+  <!-- disable insecure listeners -->
+  <http_port remove="1"/>
+  <tcp_port remove="1"/>
+  <mysql_port remove="1"/>
+  <postgresql_port remove="1"/>
+  <grpc_port remove="1"/>
 
   <https_port>8443</https_port>
   <tcp_port_secure>9440</tcp_port_secure>
@@ -225,6 +229,7 @@ docker exec ch-nonfips sh -c 'for f in /etc/clickhouse-server/config.d/*.xml; do
 4. Create local config for `clickhouse-backup-fips`:
 
 ```bash
+rm -f /tmp/ch-backup-nonfips.yml
 cat > /tmp/ch-backup-nonfips.yml <<'EOF'
 general:
   remote_storage: none
@@ -247,6 +252,105 @@ Note: `secure: false` is intentional in this local connectivity smoke check. TLS
 
 Expected result:
 - `tables` command succeeds against non-FIPS ClickHouse server.
+
+#### Optional extension for Test Case 2a (manual negative TLS)
+
+Goal: verify strict FIPS runtime in `clickhouse-backup-fips` rejects non-FIPS TLS profile on non-FIPS ClickHouse image (`25.8.16.10002.altinitystable`).
+
+Extension steps:
+
+1. Create TLS certs used by ClickHouse in container:
+
+```bash
+rm -rf /tmp/ch-fips-certs
+mkdir -p /tmp/ch-fips-certs
+openssl req -x509 -nodes -newkey rsa:4096 -days 365 \
+  -keyout /tmp/ch-fips-certs/server.key \
+  -out /tmp/ch-fips-certs/server.crt \
+  -subj "/CN=localhost"
+chmod 755 /tmp/ch-fips-certs
+chmod 644 /tmp/ch-fips-certs/server.crt /tmp/ch-fips-certs/server.key
+```
+
+2. Create non-FIPS TLS ClickHouse config (`/tmp/ch-fips.xml`):
+
+```bash
+rm -f /tmp/ch-fips.xml
+cat > /tmp/ch-fips.xml <<'EOF'
+<clickhouse>
+  <https_port>8443</https_port>
+  <tcp_port_secure>9440</tcp_port_secure>
+  <openSSL>
+    <server>
+      <certificateFile>/etc/clickhouse-server/certs/server.crt</certificateFile>
+      <privateKeyFile>/etc/clickhouse-server/certs/server.key</privateKeyFile>
+      <cipherList>ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:AES128-SHA</cipherList>
+      <cipherSuites>TLS_CHACHA20_POLY1305_SHA256</cipherSuites>
+      <disableProtocols>sslv2,sslv3</disableProtocols>
+      <verificationMode>none</verificationMode>
+    </server>
+  </openSSL>
+</clickhouse>
+EOF
+```
+
+3. Run non-FIPS ClickHouse with this TLS profile:
+
+```bash
+docker rm -f ch-fips 2>/dev/null || true
+docker run -d --name ch-fips \
+  -p 8443:8443 -p 9440:9440 \
+  -e CLICKHOUSE_USER=backup \
+  -e CLICKHOUSE_PASSWORD=backup123 \
+  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+  -v /tmp/ch-fips.xml:/etc/clickhouse-server/config.d/fips.xml:ro \
+  -v /tmp/ch-fips-certs:/etc/clickhouse-server/certs:ro \
+  altinity/clickhouse-server:25.8.16.10002.altinitystable
+```
+
+4. Create client config that uses secure native port (`9440`):
+
+```bash
+rm -f /tmp/ch-backup-fips.yml
+cat > /tmp/ch-backup-fips.yml <<'EOF'
+general:
+  remote_storage: none
+clickhouse:
+  host: 127.0.0.1
+  port: 9440
+  username: backup
+  password: "backup123"
+  secure: true
+  skip_verify: true
+EOF
+```
+
+5. Start manual negative probe with `openssl s_server` (mandatory for this check):
+
+```bash
+docker rm -f ch-fips 2>/dev/null || true
+openssl s_server -accept 9440 \
+  -cert /tmp/ch-fips-certs/server.crt \
+  -key /tmp/ch-fips-certs/server.key \
+  -tls1_2 \
+  -cipher 'ECDHE-RSA-CHACHA20-POLY1305' \
+  -state -msg -tlsextdebug
+```
+
+6. In a separate terminal, use strict FIPS runtime and verify TLS connection is rejected:
+
+```bash
+GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-fips.yml tables
+```
+
+Note: this probe must run without ClickHouse bound to `9440` because `openssl s_server` occupies this port.
+
+Expected extension result:
+- This server profile is intentionally non-FIPS and is for negative testing only.
+- In strict mode, `clickhouse-backup-fips` should fail to negotiate TLS and not return normal `tables` output.
+- The failure is expected specifically because the server offers non-FIPS cipher `ECDHE-RSA-CHACHA20-POLY1305`.
+- Typical `openssl s_server` output includes `fatal handshake_failure` and `no shared cipher`.
+- Typical `clickhouse-backup-fips` output includes `remote error: tls: handshake failure` during ping/retry loop.
 
 ## Test Case 2b
 
@@ -302,6 +406,10 @@ Steps:
 source ~/venv/qa/bin/activate
 make clean build-race-fips-docker
 ```
+
+Expected result: build completes and `./clickhouse-backup/clickhouse-backup-race-fips` is available.
+
+Expected result: build completes and `./clickhouse-backup/clickhouse-backup-race-fips` is available.
 
 2. Check binary version output:
 
@@ -420,7 +528,7 @@ This manual check is covered by automated scenario `failfipscast_known_answer_te
 
 ### Validate inbound TLS cipher policy with `openssl s_client` (FIPS-compatible vs non-compatible)
 
-Goal: verify inbound TLS policy of `clickhouse-backup-fips` API server using `openssl s_client`: FIPS-compatible cipher handshakes are allowed and non-compatible cipher handshakes are rejected (TLSv1.3 `-ciphersuites`, TLSv1.2 `-cipher`).
+Goal: verify inbound TLS policy of `clickhouse-backup-fips` API server using `openssl s_client`: FIPS-compatible TLSv1.3 cipher handshakes are allowed and non-compatible cipher handshakes are rejected. TLSv1.2 checks are optional and environment-dependent.
 Role mapping:
 - TLS server under test: `clickhouse-backup-fips server` (API endpoint on `:7172`).
 - TLS client used to probe policy: `openssl s_client`.
@@ -442,22 +550,109 @@ source ~/venv/qa/bin/activate
 make clean build-race-fips-docker
 ```
 
-2. Start `clickhouse-backup-fips` API server in strict FIPS mode with temporary TLS certificate:
+2. Start `clickhouse-backup-fips` API server in strict FIPS mode with temporary TLS certificate and explicit config:
+
+Important: even though this test validates inbound TLS on `clickhouse-backup` API server, `clickhouse-backup ... server` still requires a reachable ClickHouse backend. If ClickHouse is not reachable at startup, API listener `:7172` will not start.
+Prerequisite: ClickHouse must be reachable at `127.0.0.1:9000` with user `backup` / password `backup123`.
+Documentation reference:
+- `ReadMe.md` API config section (`api.listen`, `api.secure`, `api.private_key_file`, `api.certificate_file`).
+- `ReadMe.md` CLI section: `clickhouse-backup server - Run API server`.
+
+If ClickHouse is not running on `127.0.0.1:9000`, start local ClickHouse first (example):
+
+```bash
+docker rm -f ch-for-api 2>/dev/null || true
+docker run -d --name ch-for-api \
+  -p 9000:9000 -p 8123:8123 \
+  -e CLICKHOUSE_USER=backup \
+  -e CLICKHOUSE_PASSWORD=backup123 \
+  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+  altinity/clickhouse-server:25.8.16.10002.altinitystable
+```
+
+Mandatory pre-check (run before starting API server):
+
+```bash
+ss -ltn | grep -E ':9000\b' >/dev/null || {
+  echo "ClickHouse is not listening on 127.0.0.1:9000"
+  echo "Start it first (example command is shown above) and retry."
+}
+```
+
+2.1 Generate local CA and server TLS certificate:
 
 ```bash
 TMP_TLS_DIR=/tmp/chb-fips-tls
 rm -rf "$TMP_TLS_DIR" && mkdir -p "$TMP_TLS_DIR"
-openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
-  -keyout "$TMP_TLS_DIR/server-key.pem" \
-  -out "$TMP_TLS_DIR/server-cert.pem" \
+openssl genrsa -out "$TMP_TLS_DIR/ca-key.pem" 2048
+openssl req -x509 -new -sha256 -days 1 \
+  -key "$TMP_TLS_DIR/ca-key.pem" \
+  -out "$TMP_TLS_DIR/ca-cert.pem" \
+  -subj "/CN=chb-fips-test-ca"
+openssl genrsa -out "$TMP_TLS_DIR/server-key.pem" 2048
+openssl req -new \
+  -key "$TMP_TLS_DIR/server-key.pem" \
+  -out "$TMP_TLS_DIR/server.csr" \
   -subj "/CN=localhost"
-pkill -f "clickhouse-backup-race-fips server" 2>/dev/null || true
+cat > "$TMP_TLS_DIR/server-ext.cnf" <<'EOF'
+subjectAltName=DNS:localhost,IP:127.0.0.1
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+authorityKeyIdentifier=keyid,issuer
+EOF
+openssl x509 -req -sha256 -days 1 \
+  -in "$TMP_TLS_DIR/server.csr" \
+  -CA "$TMP_TLS_DIR/ca-cert.pem" \
+  -CAkey "$TMP_TLS_DIR/ca-key.pem" \
+  -CAcreateserial \
+  -out "$TMP_TLS_DIR/server-cert.pem" \
+  -extfile "$TMP_TLS_DIR/server-ext.cnf"
+openssl verify -CAfile "$TMP_TLS_DIR/ca-cert.pem" "$TMP_TLS_DIR/server-cert.pem"
+rm -f "$TMP_TLS_DIR/server.csr" "$TMP_TLS_DIR/server-ext.cnf" "$TMP_TLS_DIR/ca-cert.srl"
+```
+
+Expected result: certificate verification command reports `server-cert.pem: OK`.
+
+2.2 Start `clickhouse-backup-fips` API server with generated certs:
+
+```bash
+TMP_TLS_DIR=/tmp/chb-fips-tls
+test -f "$TMP_TLS_DIR/ca-cert.pem" \
+  && test -f "$TMP_TLS_DIR/server-cert.pem" \
+  && test -f "$TMP_TLS_DIR/server-key.pem" \
+  || { echo "missing TLS files from Step 2.1, rerun Step 2.1 first"; }
+rm -f /tmp/ch-backup-fips.yml
+cat > /tmp/ch-backup-fips.yml <<'EOF'
+general:
+  remote_storage: none
+clickhouse:
+  host: 127.0.0.1
+  port: 9000
+  username: backup
+  password: "backup123"
+  secure: false
+EOF
+pkill -x clickhouse-backup-race-fips 2>/dev/null || true
 API_SECURE=true API_LISTEN=0.0.0.0:7172 \
 API_PRIVATE_KEY_FILE="$TMP_TLS_DIR/server-key.pem" \
 API_CERTIFICATE_FILE="$TMP_TLS_DIR/server-cert.pem" \
 GODEBUG=fips140=only \
-./clickhouse-backup/clickhouse-backup-race-fips server >"$TMP_TLS_DIR/server.log" 2>&1 &
+./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-fips.yml server >"$TMP_TLS_DIR/server.log" 2>&1 &
 sleep 2
+ss -ltn | grep -E ':7172\b' >/dev/null || { echo "server did not start"; grep -n "." "$TMP_TLS_DIR/server.log" || true; }
+```
+
+If the startup check fails, review `"$TMP_TLS_DIR/server.log"` and fix the environment before continuing.
+
+Expected result: API server listens on `:7172` with TLS enabled.
+
+Pre-setup requirement for Steps 3+: run this check and continue only if all files exist:
+
+```bash
+test -f /tmp/chb-fips-tls/ca-cert.pem \
+  && test -f /tmp/chb-fips-tls/server-cert.pem \
+  && test -f /tmp/chb-fips-tls/server-key.pem \
+  || { echo "missing TLS files, rerun Step 2"; }
 ```
 
 3. Run `openssl s_client` with FIPS-compatible TLSv1.3 ciphersuite (`cipherSuites` equivalent):
@@ -465,39 +660,79 @@ sleep 2
 ```bash
 openssl s_client -connect localhost:7172 -brief -tls1_3 \
   -ciphersuites TLS_AES_128_GCM_SHA256 \
-  -CAfile "$TMP_TLS_DIR/server-cert.pem" < /dev/null
+  -CAfile /tmp/chb-fips-tls/ca-cert.pem < /dev/null
 ```
+
+Expected result (Positive): success (`CONNECTION ESTABLISHED`, TLSv1.3 handshake completed).
 
 4. Run `openssl s_client` with non-compatible TLSv1.3 ciphersuite:
 
 ```bash
 openssl s_client -connect localhost:7172 -brief -tls1_3 \
   -ciphersuites TLS_CHACHA20_POLY1305_SHA256 \
-  -CAfile "$TMP_TLS_DIR/server-cert.pem" < /dev/null
+  -CAfile /tmp/chb-fips-tls/ca-cert.pem < /dev/null
 ```
 
-5. Run TLSv1.2 check using `-cipher` (`cipherList` equivalent):
+Expected result (Negative): failure (`handshake failure`, `alert handshake failure`, or equivalent), because `TLS_CHACHA20_POLY1305_SHA256` is intentionally outside the FIPS-compatible allowlist used by this inbound TLS policy check.
+
+5. Optional TLSv1.2 negative probe A using `-cipher` (`cipherList` equivalent):
 
 ```bash
 openssl s_client -connect localhost:7172 -brief -tls1_2 \
   -cipher AES128-GCM-SHA256 \
-  -CAfile "$TMP_TLS_DIR/server-cert.pem" < /dev/null
-openssl s_client -connect localhost:7172 -brief -tls1_2 \
-  -cipher ECDHE-RSA-CHACHA20-POLY1305 \
-  -CAfile "$TMP_TLS_DIR/server-cert.pem" < /dev/null
+  -CAfile /tmp/chb-fips-tls/ca-cert.pem < /dev/null
 ```
 
-6. Stop test server:
+Expected result (Negative): failure (`handshake failure`, `alert handshake failure`, or equivalent), because `AES128-GCM-SHA256` maps to a TLSv1.2 RSA key-exchange suite that is not offered by this server policy.
+
+5.1 Optional TLSv1.2 negative probe B using `-cipher`:
+
+```bash
+openssl s_client -connect localhost:7172 -brief -tls1_2 \
+  -cipher ECDHE-RSA-CHACHA20-POLY1305 \
+  -CAfile /tmp/chb-fips-tls/ca-cert.pem < /dev/null
+```
+
+Expected result (Negative): failure (`handshake failure`, `alert handshake failure`, or equivalent), because `ECDHE-RSA-CHACHA20-POLY1305` is intentionally outside the allowed cipher policy.
+
+6. Use `openssl s_client` to perform a real HTTPS request against the REST API (`/health`):
+
+```bash
+printf 'GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | \
+openssl s_client -connect localhost:7172 -servername localhost -quiet -tls1_3 \
+  -ciphersuites TLS_AES_128_GCM_SHA256 \
+  -CAfile /tmp/chb-fips-tls/ca-cert.pem
+```
+
+Expected result (Positive): HTTP response is returned over TLS (for example `HTTP/1.1 200 OK` and health payload).
+
+7. Optional: use REST client (`curl`) over TLS to verify API endpoint reachability:
+
+```bash
+curl --fail --silent --show-error \
+  --cacert /tmp/chb-fips-tls/ca-cert.pem \
+  https://localhost:7172/health
+
+curl --fail --silent --show-error \
+  --cacert /tmp/chb-fips-tls/ca-cert.pem \
+  https://localhost:7172/backup/list || true
+```
+
+Expected result:
+- Positive check: `/health` succeeds.
+- Environment-dependent check: `/backup/list` returns JSON when backend/storage is ready; non-zero exit is acceptable in minimal local smoke setup.
+
+If `curl` fails with `SSL certificate problem: self-signed certificate`, rerun Step 2 and confirm cert chain validation line `server-cert.pem: OK` appears from `openssl verify`.
+
+8. Stop test server:
 
 ```bash
 pkill -f "clickhouse-backup-race-fips server" 2>/dev/null || true
 ```
 
-Expected result:
-- TLSv1.3 with `TLS_AES_128_GCM_SHA256` succeeds (handshake established).
-- TLSv1.3 with `TLS_CHACHA20_POLY1305_SHA256` is rejected (handshake failure / no shared cipher / alert).
-- TLSv1.2 with `AES128-GCM-SHA256` succeeds.
-- TLSv1.2 with `ECDHE-RSA-CHACHA20-POLY1305` is rejected.
+Expected result: background `clickhouse-backup-fips server` process stops.
+
+Notes:
 - The same inbound TLS policy applies to endpoints on this secure listener, including `/metrics` when metrics are enabled on the API server.
 - This manual check is covered by automated scenario `inbound_tls_cipher_negotiation` (TLSv1.3 allow/deny path).
 
@@ -541,102 +776,6 @@ Expected result:
 - Connection to non-compatible `openssl s_server` cipher fails at TLS negotiation (`handshake failure`, `no shared cipher`, or equivalent TLS error).
 - Test is covered by automated scenario `outbound_tls_cipher_negotiation`.
 - If AWS SDK endpoint rules block custom FIPS endpoint usage (`custom endpoint cannot be combined with fips`), scenario is skipped with explicit reason; this is an environment/platform limitation, not a cipher-policy failure.
-
-## Optional extension for Test Case 2a (manual negative TLS)
-
-Goal: verify strict FIPS runtime in `clickhouse-backup-fips` rejects non-FIPS TLS profile on non-FIPS ClickHouse image (`25.8.16.10002.altinitystable`).
-
-Steps:
-
-1. Create TLS certs used by ClickHouse in container:
-
-```bash
-mkdir -p /tmp/ch-fips-certs
-openssl req -x509 -nodes -newkey rsa:4096 -days 365 \
-  -keyout /tmp/ch-fips-certs/server.key \
-  -out /tmp/ch-fips-certs/server.crt \
-  -subj "/CN=localhost"
-chmod 755 /tmp/ch-fips-certs
-chmod 644 /tmp/ch-fips-certs/server.crt /tmp/ch-fips-certs/server.key
-```
-
-2. Create non-FIPS TLS ClickHouse config (`/tmp/ch-fips.xml`):
-
-```bash
-cat > /tmp/ch-fips.xml <<'EOF'
-<clickhouse>
-  <https_port>8443</https_port>
-  <tcp_port_secure>9440</tcp_port_secure>
-  <openSSL>
-    <server>
-      <certificateFile>/etc/clickhouse-server/certs/server.crt</certificateFile>
-      <privateKeyFile>/etc/clickhouse-server/certs/server.key</privateKeyFile>
-      <cipherList>ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:AES128-SHA</cipherList>
-      <cipherSuites>TLS_CHACHA20_POLY1305_SHA256</cipherSuites>
-      <disableProtocols>sslv2,sslv3</disableProtocols>
-      <verificationMode>none</verificationMode>
-    </server>
-  </openSSL>
-</clickhouse>
-EOF
-```
-
-3. Run non-FIPS ClickHouse with this TLS profile:
-
-```bash
-docker rm -f ch-fips 2>/dev/null || true
-docker run -d --name ch-fips \
-  -p 8443:8443 -p 9440:9440 \
-  -e CLICKHOUSE_USER=backup \
-  -e CLICKHOUSE_PASSWORD=backup123 \
-  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
-  -v /tmp/ch-fips.xml:/etc/clickhouse-server/config.d/fips.xml:ro \
-  -v /tmp/ch-fips-certs:/etc/clickhouse-server/certs:ro \
-  altinity/clickhouse-server:25.8.16.10002.altinitystable
-```
-
-4. Create client config that uses secure native port (`9440`):
-
-```bash
-cat > /tmp/ch-backup-fips.yml <<'EOF'
-general:
-  remote_storage: none
-clickhouse:
-  host: 127.0.0.1
-  port: 9440
-  username: backup
-  password: "backup123"
-  secure: true
-  skip_verify: true
-EOF
-```
-
-5. Start manual negative probe with `openssl s_server` (mandatory for this check):
-
-```bash
-docker rm -f ch-fips 2>/dev/null || true
-openssl s_server -accept 9440 \
-  -cert /tmp/ch-fips-certs/server.crt \
-  -key /tmp/ch-fips-certs/server.key \
-  -tls1_2 \
-  -cipher 'ECDHE-RSA-CHACHA20-POLY1305' \
-  -state -msg -tlsextdebug
-```
-
-6. In a separate terminal, use strict FIPS runtime and verify TLS connection is rejected:
-
-```bash
-GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-fips.yml tables
-```
-
-Note: this probe must run without ClickHouse bound to `9440` because `openssl s_server` occupies this port.
-
-Expected result:
-- This server profile is intentionally non-FIPS and is for negative testing only.
-- In strict mode, `clickhouse-backup-fips` should fail to negotiate TLS and not return normal `tables` output.
-- The failure is expected specifically because the server offers non-FIPS cipher `ECDHE-RSA-CHACHA20-POLY1305`.
-- Typical `openssl s_server` output includes `fatal handshake_failure` and `no shared cipher`.
-- Typical `clickhouse-backup-fips` output includes `remote error: tls: handshake failure` during ping/retry loop.
 
 ## Final cleanup (local)
 
