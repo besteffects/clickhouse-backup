@@ -3,6 +3,7 @@
 
 - Test Case 1 (outbound): `clickhouse-backup-fips` tries to connect to `:9440` and must reject non-FIPS server cipher (`openssl s_server`).
 - Test Case 2 (inbound): `openssl s_client` tries to connect to `clickhouse-backup-fips` REST server and validates allow/deny cipher behavior.
+- Test Case 3 (outbound S3-style): `clickhouse-backup-race` with `GODEBUG=fips140=only` connects to `s3.endpoint` mapped to `openssl s_server` on `:9443` and validates allow/deny behavior for approved vs non-approved ciphers.
 
 ## Pre-setup (shared)
 
@@ -262,6 +263,7 @@ Scope:
 - Real S3 connectivity is not required.
 - The check targets TLS/FIPS enforcement during outbound connection attempts.
 - `openssl s_server` is used as a controllable HTTPS endpoint that is not a real S3 API.
+- This is a local cipher-policy validation flow, not a production AWS FIPS-endpoint integration flow.
 - Use `clickhouse-backup-race` with `GODEBUG=fips140=only` for this case.  
   `clickhouse-backup-race-fips` forces AWS FIPS endpoint rules (`AWS_USE_FIPS_ENDPOINT=true`) and can reject custom endpoints before TLS handshake, which prevents cipher-negotiation validation.
 
@@ -304,7 +306,70 @@ Expected:
 
 Setup is complete. Execute the following tests.
 
-### Test 3.1 Positive test: outbound S3 attempt is not rejected by TLS policy with compatible ciphers
+### Test 3.1 Positive test: FIPS build/runtime evidence for binary under test
+
+Run in terminal #2:
+
+```bash
+./clickhouse-backup/clickhouse-backup-race-fips --version
+```
+
+Expected result:
+- Output contains `FIPS 140-3: true`.
+- This confirms the FIPS-flavored binary artifact is present and reports FIPS mode enabled.
+
+Optional build-symbol check (if `go` tool is available locally):
+
+```bash
+go tool nm ./clickhouse-backup/clickhouse-backup-race-fips | rg fips140
+```
+
+Expected result:
+- Command prints one or more lines containing `fips140`.
+
+### Test 3.2 Negative test: expected endpoint-rule behavior for `-fips` binary with custom S3 endpoint
+
+Run in terminal #2:
+
+```bash
+cat > /tmp/ch-backup-s3-openssl.yml <<'EOF'
+general:
+  remote_storage: s3
+
+clickhouse:
+  host: 127.0.0.1
+  port: 9000
+  username: backup
+  password: "backup123"
+  secure: false
+
+s3:
+  # In fips140=only mode, keep HMAC key sizes >= 112 bits to avoid
+  # panic from crypto/hmac in AWS SigV4 signing path.
+  access_key: TESTACCESSKEY1234
+  secret_key: TESTSECRETKEY1234567890
+  bucket: test
+  region: us-east-1
+  endpoint: https://127.0.0.1:9443
+  force_path_style: true
+  disable_ssl: false
+  disable_cert_verification: true
+EOF
+
+GODEBUG=fips140=only ./clickhouse-backup/clickhouse-backup-race-fips -c /tmp/ch-backup-s3-openssl.yml list remote
+```
+
+Expected result:
+- Command fails with endpoint-rule error similar to:
+  - `S3 ResolveEndpoint: endpoint rule error, A custom endpoint cannot be combined with FIPS`.
+- This confirms AWS FIPS endpoint policy enforcement for the `-fips` binary path.
+- This check is complementary only; it does not validate TLS cipher negotiation against `openssl s_server` because failure occurs before handshake.
+
+Rationale for binary choice in remaining subtests:
+- `clickhouse-backup-race-fips` is used first for FIPS artifact/runtime and endpoint-rule evidence.
+- `clickhouse-backup-race` with `GODEBUG=fips140=only` is used for cipher-negotiation checks because this path can reach `openssl s_server` handshake with a custom S3 endpoint.
+
+### Test 3.3 Positive test: outbound S3 attempt is not rejected by TLS policy with compatible ciphers
 
 Start TLS endpoint with FIPS-compatible ciphers in terminal #1:
 
@@ -317,6 +382,13 @@ openssl s_server -accept 9443 \
   -cipher 'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256' \
   -state -msg -tlsextdebug \
   -www
+```
+
+Quick precheck in terminal #2 (optional, but recommended):
+
+```bash
+openssl s_client -connect 127.0.0.1:9443 -tls1_2 \
+  -cipher 'ECDHE-RSA-AES256-GCM-SHA384' -brief < /dev/null
 ```
 
 Create config and run in terminal #2:
@@ -354,9 +426,10 @@ Expected result:
 - `clickhouse-backup` attempts outbound HTTPS connection to the configured S3 endpoint (`127.0.0.1:9443`).
 - TLS-policy rejection should not be the failure reason (no `handshake failure` / `no shared cipher` as primary error).
 - Because `openssl s_server -www` is not a real S3 API, command should fail later with protocol/auth/content parsing errors; that is acceptable for this positive check.
+- Multiple handshake traces in terminal #1 are expected (retries/more than one request attempt).
 - `S3 ResolveEndpoint ... custom endpoint cannot be combined with FIPS` should not appear in this test path.
 
-### Test 3.2 Negative test: outbound S3 attempt is rejected by strict FIPS TLS policy
+### Test 3.4 Negative test: outbound S3 attempt is rejected by strict FIPS TLS policy
 
 Restart terminal #1 TLS endpoint with non-FIPS cipher profile:
 
@@ -371,6 +444,13 @@ openssl s_server -accept 9443 \
   -www
 ```
 
+Quick precheck in terminal #2 (optional, but recommended):
+
+```bash
+openssl s_client -connect 127.0.0.1:9443 -tls1_2 \
+  -cipher 'ECDHE-RSA-CHACHA20-POLY1305' -brief < /dev/null
+```
+
 Run in terminal #2:
 
 ```bash
@@ -381,7 +461,7 @@ Expected result:
 - ClickHouse ping succeeds (`tcp://127.0.0.1:9000`).
 - Terminal #2 shows TLS rejection from remote endpoint, typically in `BackupList ... request send failed ... remote error: tls: handshake failure`.
 - Retry behavior is expected; you may see multiple handshake attempts/errors before command returns.
-- `openssl s_server` output in terminal #1 shows failed handshake details, typically including `fatal handshake_failure` and `no shared cipher`.
+- `openssl s_server` output in terminal #1 shows failed handshake details, typically including `fatal handshake_failure` and `no shared cipher` (possibly repeated).
 - `S3 ResolveEndpoint ... custom endpoint cannot be combined with FIPS` should not appear in this test path.
 
 ---
