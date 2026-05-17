@@ -63,9 +63,9 @@ def fips_binary_connectivity_fips_clickhouse(self):
     with Then("version output should report FIPS 140-3 enabled"):
         assert "FIPS 140-3:\t true" in version_out.output, error(version_out.output)
 
-    with When("I run tables command against FIPS-compatible ClickHouse"):
+    with When("I run tables command against FIPS-compatible ClickHouse in strict FIPS mode"):
         tables_out = backup.cmd(
-            f"GODEBUG=fips140=on {fips_bin} -c /etc/clickhouse-backup/config.yml tables",
+            f"GODEBUG=fips140=only {fips_bin} -c /etc/clickhouse-backup/config.yml tables",
             no_checks=True,
         )
 
