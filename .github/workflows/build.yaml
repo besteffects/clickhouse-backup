@@ -256,7 +256,7 @@ jobs:
           retention-days: 7
 
   test:
-    needs: testflows
+    needs: build
     name: Test
     runs-on: ubuntu-24.04
     strategy:
