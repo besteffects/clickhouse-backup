@@ -214,6 +214,11 @@ jobs:
         with:
           go-version: '^${{ matrix.golang-version }}'
 
+      - uses: actions/download-artifact@v7
+        with:
+          name: build-test-artifacts
+          path: ./clickhouse-backup/
+
       - name: Install python venv
         run: |
           set -x
@@ -240,6 +245,7 @@ jobs:
           GOROOT: ${{ env.GOROOT_1_26_X64 }}
         run: |
           set -xe
+          chmod +x $(pwd)/clickhouse-backup/clickhouse-backup*
           source ~/venv/qa/bin/activate
           python3 test/testflows/clickhouse_backup/tests/fips_140_3.py
 
