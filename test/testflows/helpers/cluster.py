@@ -1,6 +1,7 @@
 import glob
 import inspect
 import os
+import shlex
 import tempfile
 import testflows.settings as settings
 import threading
@@ -131,6 +132,82 @@ class Node(object):
                 assert expect_message in r.output, error(r.output)
 
         return r
+
+
+class BackupNode(Node):
+    """Node helpers specific for clickhouse-backup service process control."""
+
+    server_pid_file = "/tmp/clickhouse-backup-server.pid"
+    server_log_file = "/tmp/clickhouse-backup-server.log"
+
+    def _env_prefix(self, extra_env):
+        if not extra_env:
+            return ""
+        parts = []
+        for key, value in extra_env.items():
+            parts.append(f"{key}={shlex.quote(str(value))}")
+        return " ".join(parts) + " "
+
+    def start_backup_server(self, binary_path="/bin/clickhouse-backup", extra_env=None, wait_ready=True, timeout=60):
+        """Start clickhouse-backup server explicitly inside the backup container."""
+        env_prefix = self._env_prefix(extra_env)
+        self.cmd(
+            "bash -lc '"
+            "pkill -f \"clickhouse-backup.*server\" >/dev/null 2>&1 || true; "
+            f"nohup {env_prefix}{binary_path} server > {self.server_log_file} 2>&1 & "
+            f"echo $! > {self.server_pid_file}"
+            "'",
+            exitcode=0,
+        )
+
+        if wait_ready:
+            self.cmd(
+                "bash -lc '"
+                f"for i in $(seq 1 {int(timeout)}); do "
+                "curl -fsS http://localhost:7171/backup/status >/dev/null && exit 0; "
+                "sleep 1; "
+                "done; "
+                f"echo \"server did not become ready in {int(timeout)}s\"; "
+                f"tail -n 50 {self.server_log_file} || true; "
+                "exit 1"
+                "'",
+                exitcode=0,
+                timeout=(int(timeout) + 10),
+            )
+
+    def stop_backup_server(self):
+        """Stop clickhouse-backup server gracefully."""
+        self.cmd(
+            "bash -lc '"
+            f"if [ -f {self.server_pid_file} ]; then "
+            f"kill $(cat {self.server_pid_file}) >/dev/null 2>&1 || true; "
+            f"rm -f {self.server_pid_file}; "
+            "fi; "
+            "pkill -f \"clickhouse-backup.*server\" >/dev/null 2>&1 || true"
+            "'",
+            exitcode=0,
+        )
+
+    def kill_backup_server(self):
+        """Kill clickhouse-backup server forcefully."""
+        self.cmd(
+            "bash -lc '"
+            f"if [ -f {self.server_pid_file} ]; then "
+            f"kill -9 $(cat {self.server_pid_file}) >/dev/null 2>&1 || true; "
+            f"rm -f {self.server_pid_file}; "
+            "fi; "
+            "pkill -9 -f \"clickhouse-backup.*server\" >/dev/null 2>&1 || true"
+            "'",
+            exitcode=0,
+        )
+
+    def copy_binary_for_tamper(self, source_path="/bin/clickhouse-backup", target_path="/tmp/clickhouse-backup-test"):
+        """Create writable copy of the binary for corruption tests."""
+        self.cmd(
+            f"cp -f {shlex.quote(source_path)} {shlex.quote(target_path)} && chmod +x {shlex.quote(target_path)}",
+            exitcode=0,
+        )
+        return target_path
 
 
 class ClickHouseNode(Node):
@@ -525,6 +602,10 @@ class Cluster(object):
 
         self.lock = threading.Lock()
 
+    def _env(self, key, default=None):
+        """Read environment value preferring cluster-local overrides."""
+        return self.environ.get(key, os.environ.get(key, default))
+
     def docker_exec(self, node_name):
         """Return a 'docker exec <container_id>' prefix string for piping commands."""
         container_id = self.get_container_id(node_name)
@@ -761,6 +842,8 @@ class Cluster(object):
         """Get object with node bound methods
         :param node_name: name of service name
         """
+        if node_name == "clickhouse_backup":
+            return BackupNode(self, node_name)
         if node_name.startswith("clickhouse"):
             return ClickHouseNode(self, node_name)
         return Node(self, node_name)
@@ -878,6 +961,32 @@ class Cluster(object):
             self._container_ids.pop(name, None)
             self._containers.pop(name, None)
 
+    def start_auxiliary_container(self, name, image, hostname=None, env=None, volumes=None,
+                                  ports=None, entrypoint=None, command=None, cap_add=None,
+                                  healthcheck=None):
+        """Start extra sidecar-like container attached to test network.
+
+        Intended for tools/endpoints used by tests (for example openssl s_server).
+        """
+        if name in self._container_ids:
+            raise RuntimeError(f"container '{name}' already exists")
+        return self._start_container(
+            name=name,
+            image=image,
+            hostname=hostname,
+            env=env,
+            volumes=volumes,
+            ports=ports,
+            entrypoint=entrypoint,
+            command=command,
+            cap_add=cap_add,
+            healthcheck=healthcheck,
+        )
+
+    def stop_auxiliary_container(self, name):
+        """Stop and remove previously started auxiliary container."""
+        self._stop_container(name)
+
     def up(self, timeout=120):
         if self.local:
             with Given("I am running in local mode"):
@@ -896,17 +1005,17 @@ class Cluster(object):
             with And("I list environment variables to show their values"):
                 self.command(None, "env | grep CLICKHOUSE")
 
-        clickhouse_version = os.environ.get("CLICKHOUSE_VERSION", "26.3")
-        clickhouse_image = os.environ.get("CLICKHOUSE_IMAGE", "clickhouse/clickhouse-server")
-        zookeeper_version = os.environ.get("ZOOKEEPER_VERSION", "3.9.5")
-        zookeeper_image = os.environ.get("ZOOKEEPER_IMAGE", "docker.io/zookeeper")
-        mysql_version = os.environ.get("MYSQL_VERSION", "latest")
-        pgsql_version = os.environ.get("PGSQL_VERSION", "latest")
-        minio_version = os.environ.get("MINIO_VERSION", "latest")
-        tests_dir = os.environ.get("CLICKHOUSE_TESTS_DIR", self.configs_dir)
-        log_level = os.environ.get("LOG_LEVEL", "info")
-        gcs_cred_json = os.environ.get("QA_GCS_CRED_JSON", "")
-        gcs_cred_json_encoded = os.environ.get("QA_GCS_CRED_JSON_ENCODED", "")
+        clickhouse_version = self._env("CLICKHOUSE_VERSION", "26.3")
+        clickhouse_image = self._env("CLICKHOUSE_IMAGE", "clickhouse/clickhouse-server")
+        zookeeper_version = self._env("ZOOKEEPER_VERSION", "3.9.5")
+        zookeeper_image = self._env("ZOOKEEPER_IMAGE", "docker.io/zookeeper")
+        mysql_version = self._env("MYSQL_VERSION", "latest")
+        pgsql_version = self._env("PGSQL_VERSION", "latest")
+        minio_version = self._env("MINIO_VERSION", "latest")
+        tests_dir = self._env("CLICKHOUSE_TESTS_DIR", self.configs_dir)
+        log_level = self._env("LOG_LEVEL", "info")
+        gcs_cred_json = self._env("QA_GCS_CRED_JSON", "")
+        gcs_cred_json_encoded = self._env("QA_GCS_CRED_JSON_ENCODED", "")
 
         with Given("testcontainers cluster"):
             max_attempts = 5
@@ -1223,6 +1332,7 @@ class Cluster(object):
 
         # 5. clickhouse_backup (shares volumes from clickhouse1)
         with And("starting clickhouse_backup"):
+            backup_autostart = self._env("CLICKHOUSE_BACKUP_AUTOSTART_SERVER", "1").lower() not in ("0", "false", "no")
             # Find the backup binary
             backup_binary = os.path.normpath(os.path.join(tests_dir, "../../../clickhouse-backup/clickhouse-backup-race"))
             coverage_dir = os.path.normpath(os.path.join(tests_dir, "../_coverage_"))
@@ -1246,6 +1356,7 @@ class Cluster(object):
                     "GCS_CREDENTIALS_JSON_ENCODED": gcs_cred_json_encoded,
                     "CLICKHOUSE_HOST": "clickhouse1",
                     "CLICKHOUSE_BACKUP_CONFIG": "/etc/clickhouse-backup/config.yml",
+                    "CLICKHOUSE_BACKUP_AUTOSTART_SERVER": "1" if backup_autostart else "0",
                     "TZ": "Europe/Moscow",
                     "GOCOVERDIR": "/tmp/_coverage_/",
                 },
@@ -1259,11 +1370,11 @@ class Cluster(object):
                     "apt-get update && "
                     "apt-get install -y ca-certificates tzdata bash curl && "
                     "update-ca-certificates && "
-                    "clickhouse-backup server"
+                    + ("clickhouse-backup server" if backup_autostart else "sleep infinity")
                 ],
                 cap_add=["SYS_NICE"],
                 healthcheck={
-                    "Test": ["CMD-SHELL", "curl http://backup:7171/backup/status"],
+                    "Test": ["CMD-SHELL", "curl http://backup:7171/backup/status"] if backup_autostart else ["CMD-SHELL", "echo 1"],
                     "Interval": 5 * 1_000_000_000,
                     "Timeout": 5 * 1_000_000_000,
                     "Retries": 40,
