@@ -94,7 +94,9 @@ jobs:
       GCS_TESTS: ${{ steps.secrets.outputs.GCS_TESTS }}
 
   testflows:
-    needs: build
+    needs:
+      - build
+      - testflows_fips
     name: Testflows
     runs-on: ubuntu-22.04
     strategy:
@@ -194,7 +196,6 @@ jobs:
   testflows_fips:
     needs:
       - build
-      - testflows
     name: Testflows FIPS
     runs-on: ubuntu-22.04
     strategy:
@@ -255,7 +256,7 @@ jobs:
           retention-days: 7
 
   test:
-    needs: build
+    needs: testflows
     name: Test
     runs-on: ubuntu-24.04
     strategy:
