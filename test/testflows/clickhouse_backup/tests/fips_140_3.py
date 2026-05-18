@@ -1,10 +1,15 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+from contextlib import contextmanager
 
 from testflows.asserts import error
 from testflows.core import *
+
+append_path(sys.path, os.path.normpath(os.path.join(os.path.dirname(__file__), "../..")))
+from helpers.cluster import Cluster
 
 
 def repo_root():
@@ -104,6 +109,81 @@ def run_fips_version_check(fips_bin, mode_name, mode_value, required_version_mar
         assert required_version_marker in result.stdout, error(result.stdout)
 
 
+def tests_root_dir():
+    """Return absolute path to test/testflows/clickhouse_backup."""
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def backup_tests_nodes():
+    """Node set compatible with existing backup regression harness."""
+    return {
+        "clickhouse": ("clickhouse1", "clickhouse2"),
+        "clickhouse_backup": ("clickhouse_backup",),
+        "kafka": ("kafka",),
+        "mysql": ("mysql",),
+        "postgres": ("postgres",),
+    }
+
+
+@contextmanager
+def temporary_env(overrides):
+    """Temporarily set environment variables."""
+    original = {k: os.environ.get(k) for k in overrides}
+    try:
+        for key, value in overrides.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def temporary_backup_config_dir():
+    """Create isolated backup config dir copied from baseline."""
+    base = os.path.join(tests_root_dir(), "configs", "backup")
+    temp_dir = tempfile.mkdtemp(prefix="fips-backup-config-")
+    try:
+        shutil.copytree(base, temp_dir, dirs_exist_ok=True)
+        yield temp_dir
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def run_connectivity_tables_smoke(clickhouse_version, mode_name, mode_value):
+    """Run `tables` smoke check in a temporary cluster."""
+    if not command_exists("docker"):
+        skip("docker is not available in PATH")
+
+    with temporary_backup_config_dir() as config_dir:
+        with temporary_env(
+            {
+                "CLICKHOUSE_IMAGE": "altinity/clickhouse-server",
+                "CLICKHOUSE_VERSION": clickhouse_version,
+                "CLICKHOUSE_TESTS_DIR": tests_root_dir(),
+            }
+        ):
+            with Cluster(
+                local=False,
+                configs_dir=tests_root_dir(),
+                docker_dir=os.path.join(tests_root_dir(), "docker"),
+                nodes=backup_tests_nodes(),
+                backup_config_dir=config_dir,
+            ) as cluster:
+                backup = cluster.node("clickhouse_backup")
+                env_prefix = f"GODEBUG={mode_value} " if mode_value else ""
+                tables = backup.cmd(
+                    f"{env_prefix}clickhouse-backup -c /etc/clickhouse-backup/config.yml tables",
+                    no_checks=True,
+                )
+                assert tables.exitcode == 0, error(
+                    f"mode={mode_name}, clickhouse_version={clickhouse_version}\n{tables.output}"
+                )
+
+
 @TestScenario
 def fips_version_output(self):
     """TC3 `--version` output check."""
@@ -173,6 +253,28 @@ def fips_runtime_mode_matrix(self):
 
 
 @TestScenario
+def fips_binary_connectivity_nonfips_clickhouse(self):
+    """TC2b smoke: non-FIPS ClickHouse with `GODEBUG=fips140=on`."""
+    with When("I run clickhouse-backup tables against non-FIPS ClickHouse"):
+        run_connectivity_tables_smoke(
+            clickhouse_version="25.8.16.10002.altinitystable",
+            mode_name="on",
+            mode_value="fips140=on",
+        )
+
+
+@TestScenario
+def fips_binary_connectivity_fips_clickhouse(self):
+    """TC1b subset smoke: FIPS ClickHouse with `GODEBUG=fips140=only`."""
+    with When("I run clickhouse-backup tables against FIPS ClickHouse"):
+        run_connectivity_tables_smoke(
+            clickhouse_version="25.3.8.30001.altinityfips",
+            mode_name="only",
+            mode_value="fips140=only",
+        )
+
+
+@TestScenario
 def gofips140_build_flags_present(self):
     """TC4 GOFIPS140 build flag checks"""
     required_flag = "GOFIPS140=v1.0.0"
@@ -232,6 +334,8 @@ def fips_ssl_140_3(self):
     Scenario(run=gofips140_build_flags_present, flags=TE)
     Scenario(run=fips_version_output, flags=TE)
     Scenario(run=fips_runtime_mode_matrix, flags=TE)
+    Scenario(run=fips_binary_connectivity_nonfips_clickhouse, flags=TE)
+    Scenario(run=fips_binary_connectivity_fips_clickhouse, flags=TE)
 
 
 if main():
