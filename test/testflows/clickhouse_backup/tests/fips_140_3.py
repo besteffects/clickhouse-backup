@@ -236,6 +236,33 @@ def check_dockerfile_fips_build_flags(self, dockerfile_content, dockerfile_lines
 
 
 @TestScenario
+def checksum_tamper_panics(self):
+    """TC5: tamper checksum and verify integrity self-check fails."""
+    root = repo_root()
+    fips_bin = resolve_fips_binary_step()
+    tamper_script = os.path.join(
+        root, "test/testflows/clickhouse_backup/scripts/tamper_go_fips_checksum.sh"
+    )
+
+    with Given("I locate checksum tamper script used by the plan"):
+        assert os.path.isfile(tamper_script), error(f"missing script: {tamper_script}")
+
+    with When("I run checksum tamper script against the FIPS binary"):
+        run = subprocess.run(
+            ["bash", tamper_script, fips_bin],
+            capture_output=True,
+            text=True,
+            env=build_runtime_env(None),
+        )
+        combined_output = (run.stdout or "") + ("\n" + run.stderr if run.stderr else "")
+
+    with Then("the script should report expected integrity verification failure"):
+        assert run.returncode == 0, error(combined_output)
+        assert "fips140: verification mismatch" in combined_output, error(combined_output)
+        assert "OK: FIPS integrity check failed as expected" in combined_output, error(combined_output)
+
+
+@TestScenario
 def fips_version_output(self):
     """TC3 `--version` output check."""
     fips_bin = resolve_fips_binary_step()
@@ -348,6 +375,7 @@ def fips_ssl_140_3(self):
     Scenario(run=fips_runtime_mode_matrix, flags=TE)
     Scenario(run=fips_binary_connectivity_nonfips_clickhouse, flags=TE)
     Scenario(run=fips_binary_connectivity_fips_clickhouse, flags=TE)
+    Scenario(run=checksum_tamper_panics, flags=TE)
 
 
 if main():
