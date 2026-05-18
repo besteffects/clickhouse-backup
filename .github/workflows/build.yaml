@@ -181,7 +181,16 @@ jobs:
           format: golang
           flag-name: testflows-${{ matrix.clickhouse }}
       # todo possible failures  https://github.com/actions/upload-artifact/issues/270
+      - name: Fix testflows _instances log permissions
+        if: always()
+        run: |
+          set -xe
+          if [ -d "test/testflows/clickhouse_backup/_instances" ]; then
+            sudo chown -R "$(id -u)":"$(id -g)" test/testflows/clickhouse_backup/_instances || true
+            chmod -R u+rwX test/testflows/clickhouse_backup/_instances || true
+          fi
       - name: Upload testflows logs
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: testflows-logs-and-reports-${{ matrix.clickhouse }}-${{ github.run_id }}
@@ -249,7 +258,16 @@ jobs:
           source ~/venv/qa/bin/activate
           python3 test/testflows/clickhouse_backup/tests/fips_140_3.py
 
+      - name: Fix FIPS log permissions for artifact upload
+        if: always()
+        run: |
+          set -xe
+          if [ -d "test/testflows/clickhouse_backup/_instances" ]; then
+            sudo chown -R "$(id -u)":"$(id -g)" test/testflows/clickhouse_backup/_instances || true
+            chmod -R u+rwX test/testflows/clickhouse_backup/_instances || true
+          fi
       - name: Upload FIPS testflows logs
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: fips-testflows-logs-and-reports-${{ github.run_id }}
