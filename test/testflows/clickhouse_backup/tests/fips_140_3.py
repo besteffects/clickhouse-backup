@@ -5,6 +5,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 
+import yaml
 from testflows.asserts import error
 from testflows.core import *
 
@@ -21,6 +22,43 @@ DOCKERFILE_REQUIRED_CHECKS = [
     "FROM image_short AS image_fips",
     "COPY build/${TARGETPLATFORM}/clickhouse-backup-fips /bin/clickhouse-backup",
 ]
+FIPS_TLS13_ALLOWED_CIPHERSUITES = [
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+]
+NON_FIPS_TLS13_CIPHERSUITES = [
+    "TLS_CHACHA20_POLY1305_SHA256",
+]
+NON_FIPS_TLS12_CIPHERLIST = [
+    "ECDHE-RSA-CHACHA20-POLY1305",
+    "DHE-RSA-AES128-GCM-SHA256",
+    "DHE-RSA-AES256-GCM-SHA384",
+    "DHE-RSA-CHACHA20-POLY1305",
+]
+NON_FIPS_CLICKHOUSE_PROFILE = {
+    "port": 9000,
+    "secure": False,
+    "skip_verify": False,
+}
+FIPS_CLICKHOUSE_PROFILE = {
+    "port": 9440,
+    "secure": True,
+    "skip_verify": True,
+}
+CLICKHOUSE_FIPS_PORTS_XML = """<?xml version="1.0"?>
+<yandex>
+  <https_port>8443</https_port>
+  <tcp_port_secure>9440</tcp_port_secure>
+  <openSSL>
+    <server>
+      <certificateFile>/etc/clickhouse-server/ssl/server.crt</certificateFile>
+      <privateKeyFile>/etc/clickhouse-server/ssl/server.key</privateKeyFile>
+      <dhParamsFile>/etc/clickhouse-server/ssl/dhparam.pem</dhParamsFile>
+      <verificationMode>none</verificationMode>
+    </server>
+  </openSSL>
+</yandex>
+"""
 
 
 def repo_root():
@@ -154,44 +192,290 @@ def temporary_backup_config_dir():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def run_connectivity_tables_smoke(clickhouse_version, mode_name, mode_value):
+@contextmanager
+def temporary_clickhouse_fips_config(enable_fips_ports):
+    """Create temporary fips.xml and return its path when enabled."""
+    if not enable_fips_ports:
+        yield None
+        return
+
+    temp_dir = tempfile.mkdtemp(prefix="fips-clickhouse-config-")
+    try:
+        fips_config_path = os.path.join(temp_dir, "fips.xml")
+        with open(fips_config_path, "w", encoding="utf-8") as f:
+            f.write(CLICKHOUSE_FIPS_PORTS_XML)
+        yield fips_config_path
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def patch_backup_clickhouse_config(config_path, profile):
+    """Patch clickhouse client connection settings in backup config."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+
+    clickhouse_config = config.setdefault("clickhouse", {})
+    clickhouse_config["port"] = profile["port"]
+    clickhouse_config["secure"] = profile["secure"]
+    clickhouse_config["skip_verify"] = profile["skip_verify"]
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+
+
+@TestStep(Check)
+def check_backup_clickhouse_profile_in_container(self, backup, profile):
+    """Assert patched ClickHouse settings are visible inside backup container."""
+    secure_text = str(profile["secure"]).lower()
+    skip_verify_text = str(profile["skip_verify"]).lower()
+    backup.cmd(
+        f"grep -E '^  port: {profile['port']}$' /etc/clickhouse-backup/config.yml",
+        exitcode=0,
+    )
+    backup.cmd(
+        f"grep -E '^  secure: {secure_text}$' /etc/clickhouse-backup/config.yml",
+        exitcode=0,
+    )
+    backup.cmd(
+        f"grep -E '^  skip_verify: {skip_verify_text}$' /etc/clickhouse-backup/config.yml",
+        exitcode=0,
+    )
+
+
+@TestStep(Check)
+def check_clickhouse_secure_ports_listening(self, cluster):
+    """Ensure ClickHouse FIPS config is applied in the target node."""
+    node = cluster.node("clickhouse1")
+    node.cmd("test -f /etc/clickhouse-server/config.d/fips.xml", exitcode=0)
+    node.cmd("grep -E '<https_port>8443</https_port>' /etc/clickhouse-server/config.d/fips.xml", exitcode=0)
+    node.cmd("grep -E '<tcp_port_secure>9440</tcp_port_secure>' /etc/clickhouse-server/config.d/fips.xml", exitcode=0)
+
+
+def run_connectivity_tables_smoke(
+    clickhouse_version, mode_name, mode_value, clickhouse_profile, enable_fips_ports=False
+):
     """Run `tables` smoke check in a temporary cluster."""
     if not command_exists("docker"):
         skip("docker is not available in PATH")
 
     with temporary_backup_config_dir() as config_dir:
-        cluster_env = {
-            "CLICKHOUSE_IMAGE": "altinity/clickhouse-server",
-            "CLICKHOUSE_VERSION": clickhouse_version,
-            "CLICKHOUSE_TESTS_DIR": tests_root_dir(),
-        }
-        with Cluster(
-            local=False,
-            configs_dir=tests_root_dir(),
-            docker_dir=os.path.join(tests_root_dir(), "docker"),
-            nodes=backup_tests_nodes(),
-            backup_config_dir=config_dir,
-            environ=cluster_env,
-        ) as cluster:
-            backup = cluster.node("clickhouse_backup")
-            env_prefix = f"GODEBUG={mode_value} " if mode_value else ""
-            tables = backup.cmd(
-                f"{env_prefix}clickhouse-backup -c /etc/clickhouse-backup/config.yml tables",
-                no_checks=True,
+        config_path = os.path.join(config_dir, "config.yml")
+        patch_backup_clickhouse_config(config_path=config_path, profile=clickhouse_profile)
+
+        with temporary_clickhouse_fips_config(enable_fips_ports=enable_fips_ports) as fips_config_path:
+            cluster_env = {
+                "CLICKHOUSE_IMAGE": "altinity/clickhouse-server",
+                "CLICKHOUSE_VERSION": clickhouse_version,
+                "CLICKHOUSE_TESTS_DIR": tests_root_dir(),
+                "CLICKHOUSE_BACKUP_AUTOSTART_SERVER": "0",
+            }
+            if fips_config_path:
+                cluster_env["CLICKHOUSE_EXTRA_CONFIG_PATH"] = fips_config_path
+
+            with Cluster(
+                local=False,
+                configs_dir=tests_root_dir(),
+                docker_dir=os.path.join(tests_root_dir(), "docker"),
+                nodes=backup_tests_nodes(),
+                backup_config_dir=config_dir,
+                environ=cluster_env,
+            ) as cluster:
+                backup = cluster.node("clickhouse_backup")
+                check_backup_clickhouse_profile_in_container(
+                    backup=backup, profile=clickhouse_profile
+                )
+                if enable_fips_ports:
+                    check_clickhouse_secure_ports_listening(cluster=cluster)
+
+                env_prefix = f"GODEBUG={mode_value} " if mode_value else ""
+                tables = backup.cmd(
+                    f"{env_prefix}clickhouse-backup -c /etc/clickhouse-backup/config.yml tables",
+                    no_checks=True,
+                )
+                assert tables.exitcode == 0, error(
+                    f"mode={mode_name}, clickhouse_version={clickhouse_version}\n{tables.output}"
+                )
+
+
+def copy_fips_binary_to_backup_container(cluster, backup):
+    """Copy resolved host FIPS binary into backup container."""
+    fips_bin = resolve_fips_binary_step()
+    container_id = cluster.get_container_id("clickhouse_backup")
+    cluster.command(None, f"docker cp \"{fips_bin}\" {container_id}:/bin/clickhouse-backup-fips", exitcode=0)
+    backup.cmd("chmod +x /bin/clickhouse-backup-fips")
+    return "/bin/clickhouse-backup-fips"
+
+
+@TestStep(Given)
+def setup_inbound_tls_server(self, cluster, backup):
+    """Prepare and start clickhouse-backup FIPS API TLS server on :7172."""
+    cert_dir = "/tmp/chb-fips-tls"
+    fips_bin_container = copy_fips_binary_to_backup_container(cluster=cluster, backup=backup)
+
+    with By("generating local CA and server certificate on host"):
+        with tempfile.TemporaryDirectory(prefix="chb-fips-host-tls-") as host_tls_dir:
+            ca_key = os.path.join(host_tls_dir, "ca-key.pem")
+            ca_cert = os.path.join(host_tls_dir, "ca-cert.pem")
+            server_key = os.path.join(host_tls_dir, "server-key.pem")
+            server_csr = os.path.join(host_tls_dir, "server.csr")
+            server_ext = os.path.join(host_tls_dir, "server-ext.cnf")
+            server_cert = os.path.join(host_tls_dir, "server-cert.pem")
+
+            subprocess.run(["openssl", "genrsa", "-out", ca_key, "2048"], check=True)
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-new",
+                    "-sha256",
+                    "-days",
+                    "1",
+                    "-key",
+                    ca_key,
+                    "-out",
+                    ca_cert,
+                    "-subj",
+                    "/CN=chb-fips-test-ca",
+                ],
+                check=True,
             )
-            assert tables.exitcode == 0, error(
-                f"mode={mode_name}, clickhouse_version={clickhouse_version}\n{tables.output}"
+            subprocess.run(["openssl", "genrsa", "-out", server_key, "2048"], check=True)
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-new",
+                    "-key",
+                    server_key,
+                    "-out",
+                    server_csr,
+                    "-subj",
+                    "/CN=localhost",
+                ],
+                check=True,
             )
+            with open(server_ext, "w", encoding="utf-8") as f:
+                f.write(
+                    "subjectAltName=DNS:localhost,IP:127.0.0.1\n"
+                    "keyUsage=critical,digitalSignature,keyEncipherment\n"
+                    "extendedKeyUsage=serverAuth\n"
+                    "authorityKeyIdentifier=keyid,issuer\n"
+                )
+            subprocess.run(
+                [
+                    "openssl",
+                    "x509",
+                    "-req",
+                    "-sha256",
+                    "-days",
+                    "1",
+                    "-in",
+                    server_csr,
+                    "-CA",
+                    ca_cert,
+                    "-CAkey",
+                    ca_key,
+                    "-CAcreateserial",
+                    "-out",
+                    server_cert,
+                    "-extfile",
+                    server_ext,
+                ],
+                check=True,
+            )
+
+            backup_container_id = cluster.get_container_id("clickhouse_backup")
+            clickhouse1_container_id = cluster.get_container_id("clickhouse1")
+            cluster.command(None, f"docker exec {backup_container_id} bash -lc 'mkdir -p {cert_dir}'", exitcode=0)
+            cluster.command(None, f"docker exec {clickhouse1_container_id} bash -lc 'mkdir -p {cert_dir}'", exitcode=0)
+            cluster.command(None, f"docker cp \"{server_key}\" {backup_container_id}:{cert_dir}/server-key.pem", exitcode=0)
+            cluster.command(None, f"docker cp \"{server_cert}\" {backup_container_id}:{cert_dir}/server-cert.pem", exitcode=0)
+            cluster.command(None, f"docker cp \"{ca_cert}\" {clickhouse1_container_id}:{cert_dir}/ca-cert.pem", exitcode=0)
+
+    with By("starting API TLS server in strict FIPS mode"):
+        backup.cmd("pkill -f 'clickhouse-backup-fips server' >/dev/null 2>&1 || true")
+        backup.cmd(
+            f"API_SECURE=true API_LISTEN=0.0.0.0:7172 "
+            f"API_PRIVATE_KEY_FILE={cert_dir}/server-key.pem "
+            f"API_CERTIFICATE_FILE={cert_dir}/server-cert.pem "
+            f"GODEBUG=fips140=only {fips_bin_container} -c /etc/clickhouse-backup/config.yml server "
+            f">{cert_dir}/server.log 2>&1 &"
+        )
+        backup.cmd(
+            "ready=1; for i in $(seq 1 30); do "
+            "if timeout 1 bash -c '</dev/tcp/localhost/7172'; then ready=0; break; fi; "
+            "sleep 1; done; test ${ready} -eq 0",
+            timeout=40,
+        )
+
+    return cert_dir
+
+
+@TestStep(Check)
+def check_inbound_tls13_cipher(self, client, cert_dir, ciphersuite, expected_success):
+    """Probe API TLS listener with chosen TLSv1.3 ciphersuite."""
+    out = client.cmd(
+        f"openssl s_client -connect backup:7172 -brief -tls1_3 "
+        f"-ciphersuites {ciphersuite} -CAfile {cert_dir}/ca-cert.pem < /dev/null",
+        no_checks=True,
+    )
+    output_lower = (out.output or "").lower()
+
+    if expected_success:
+        assert out.exitcode == 0, error(out.output)
+        assert "handshake failure" not in output_lower, error(out.output)
+        assert "no shared cipher" not in output_lower, error(out.output)
+    else:
+        assert (
+            out.exitcode != 0
+            or "handshake failure" in output_lower
+            or "no shared cipher" in output_lower
+            or "alert" in output_lower
+        ), error(out.output)
+
+
+@TestStep(Check)
+def check_inbound_tls12_cipher(self, client, cert_dir, cipher, expected_success):
+    """Probe API TLS listener with chosen TLSv1.2 cipher."""
+    out = client.cmd(
+        f"openssl s_client -connect backup:7172 -brief -tls1_2 "
+        f"-cipher {cipher} -CAfile {cert_dir}/ca-cert.pem < /dev/null",
+        no_checks=True,
+    )
+    output_lower = (out.output or "").lower()
+
+    if expected_success:
+        assert out.exitcode == 0, error(out.output)
+        assert "handshake failure" not in output_lower, error(out.output)
+        assert "no shared cipher" not in output_lower, error(out.output)
+    else:
+        assert (
+            out.exitcode != 0
+            or "handshake failure" in output_lower
+            or "no shared cipher" in output_lower
+            or "alert" in output_lower
+        ), error(out.output)
 
 
 @TestStep
-def check_clickhouse_tables_connectivity(self, clickhouse_kind, clickhouse_version, mode_name, mode_value):
+def check_clickhouse_tables_connectivity(
+    self,
+    clickhouse_kind,
+    clickhouse_version,
+    mode_name,
+    mode_value,
+    clickhouse_profile,
+    enable_fips_ports=False,
+):
     """Run connectivity smoke against a selected ClickHouse target."""
     with By(f"targeting {clickhouse_kind} ClickHouse {clickhouse_version} in mode {mode_name}"):
         run_connectivity_tables_smoke(
             clickhouse_version=clickhouse_version,
             mode_name=mode_name,
             mode_value=mode_value,
+            clickhouse_profile=clickhouse_profile,
+            enable_fips_ports=enable_fips_ports,
         )
 
 
@@ -263,6 +547,72 @@ def checksum_tamper_panics(self):
 
 
 @TestScenario
+def inbound_tls_cipher_negotiation(self):
+    """TC7: validate inbound TLS policy of REST API with openssl s_client."""
+    if not command_exists("docker"):
+        skip("docker is not available in PATH")
+
+    with temporary_backup_config_dir() as config_dir:
+        cluster_env = {
+            "CLICKHOUSE_IMAGE": "altinity/clickhouse-server",
+            "CLICKHOUSE_VERSION": "25.8.16.10002.altinitystable",
+            "CLICKHOUSE_TESTS_DIR": tests_root_dir(),
+            "CLICKHOUSE_BACKUP_AUTOSTART_SERVER": "0",
+        }
+        with Cluster(
+            local=False,
+            configs_dir=tests_root_dir(),
+            docker_dir=os.path.join(tests_root_dir(), "docker"),
+            nodes=backup_tests_nodes(),
+            backup_config_dir=config_dir,
+            environ=cluster_env,
+        ) as cluster:
+            backup = cluster.node("clickhouse_backup")
+            clickhouse_client = cluster.node("clickhouse1")
+            cert_dir = None
+            try:
+                with Given("I prepare clickhouse-backup-fips API TLS server endpoint"):
+                    cert_dir = setup_inbound_tls_server(cluster=cluster, backup=backup)
+
+                with When("I probe API with allowed TLSv1.3 ciphersuite"):
+                    for ciphersuite in FIPS_TLS13_ALLOWED_CIPHERSUITES:
+                        with Check(f"TLSv1.3 cipher {ciphersuite} should be accepted"):
+                            check_inbound_tls13_cipher(
+                                client=clickhouse_client,
+                                cert_dir=cert_dir,
+                                ciphersuite=ciphersuite,
+                                expected_success=True,
+                            )
+
+                with And("I probe API with non-FIPS TLSv1.3 ciphersuite"):
+                    for ciphersuite in NON_FIPS_TLS13_CIPHERSUITES:
+                        with Check(f"TLSv1.3 cipher {ciphersuite} should be rejected"):
+                            check_inbound_tls13_cipher(
+                                client=clickhouse_client,
+                                cert_dir=cert_dir,
+                                ciphersuite=ciphersuite,
+                                expected_success=False,
+                            )
+
+                with And("I probe API with non-FIPS TLSv1.2 ciphers from cipherList"):
+                    for cipher in NON_FIPS_TLS12_CIPHERLIST:
+                        with Check(f"TLSv1.2 cipher {cipher} should be rejected"):
+                            check_inbound_tls12_cipher(
+                                client=clickhouse_client,
+                                cert_dir=cert_dir,
+                                cipher=cipher,
+                                expected_success=False,
+                            )
+            finally:
+                with Finally("I stop temporary API TLS server"):
+                    container_id = cluster.get_container_id("clickhouse_backup")
+                    cluster.command(
+                        None,
+                        f"docker exec {container_id} bash -lc \"pkill -f 'clickhouse-backup-fips server' >/dev/null 2>&1 || true\"",
+                    )
+
+
+@TestScenario
 def fips_version_output(self):
     """TC3 `--version` output check."""
     fips_bin = resolve_fips_binary_step()
@@ -331,6 +681,7 @@ def fips_binary_connectivity_nonfips_clickhouse(self):
             clickhouse_version="25.8.16.10002.altinitystable",
             mode_name="on",
             mode_value="fips140=on",
+            clickhouse_profile=NON_FIPS_CLICKHOUSE_PROFILE,
         )
 
 
@@ -343,6 +694,8 @@ def fips_binary_connectivity_fips_clickhouse(self):
             clickhouse_version="25.3.8.30001.altinityfips",
             mode_name="only",
             mode_value="fips140=only",
+            clickhouse_profile=FIPS_CLICKHOUSE_PROFILE,
+            enable_fips_ports=True,
         )
 
 
@@ -376,6 +729,7 @@ def fips_ssl_140_3(self):
     Scenario(run=fips_binary_connectivity_nonfips_clickhouse, flags=TE)
     Scenario(run=fips_binary_connectivity_fips_clickhouse, flags=TE)
     Scenario(run=checksum_tamper_panics, flags=TE)
+    Scenario(run=inbound_tls_cipher_negotiation, flags=TE)
 
 
 if main():

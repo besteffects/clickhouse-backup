@@ -1262,6 +1262,11 @@ class Cluster(object):
             (os.path.join(tests_dir, "configs/clickhouse/config.d/zookeeper.xml"), "/etc/clickhouse-server/config.d/zookeeper.xml"),
             (os.path.join(tests_dir, "configs/clickhouse/users.d/default.xml"), "/etc/clickhouse-server/users.d/default.xml"),
         ]
+        extra_clickhouse_config = self._env("CLICKHOUSE_EXTRA_CONFIG_PATH")
+        if extra_clickhouse_config:
+            ch_base_volumes.append(
+                (extra_clickhouse_config, "/etc/clickhouse-server/config.d/fips.xml")
+            )
 
         ch_image = f"{clickhouse_image}:{clickhouse_version}"
 
