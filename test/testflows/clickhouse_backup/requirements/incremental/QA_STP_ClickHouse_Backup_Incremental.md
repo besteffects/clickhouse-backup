@@ -9,191 +9,160 @@
 
 ## Table of Contents
 
+* 1 [Introduction](#introduction)
+* 2 [How Incremental Backups Work in clickhouse-backup](#how-incremental-backups-work-in-clickhouse-backup)
+* 3 [Testing Approach](#testing-approach)
+* 4 [Scope and Relationship to Existing Tests](#scope-and-relationship-to-existing-tests)
+* 5 [Timeline](#timeline)
+* 6 [Commands and Options Used](#commands-and-options-used)
+* 7 [Test Environment](#test-environment)
+* 8 [References](#references)
+* 9 [Human Resources And Assignments](#human-resources-and-assignments)
+* 10 [Release Notes](#release-notes)
+* 11 [Test Scenarios](#test-scenarios)
+    * [Scenario 1: Create and restore a single incremental backup](#scenario-1)
+    * [Scenario 2: Incremental backup after adding new data](#scenario-2)
+    * [Scenario 3: Incremental backup when nothing changed](#scenario-3)
+    * [Scenario 4: A changed part with the same name is uploaded again](#scenario-4)
+    * [Scenario 5: Incremental backup after deleting data](#scenario-5)
+    * [Scenario 6: Restore from a long chain of incremental backups](#scenario-6)
+    * [Scenario 7: Restore an earlier backup in the chain](#scenario-7)
+    * [Scenario 8: Restore reused parts from a local backup or by download](#scenario-8)
+    * [Scenario 9: Keep backups that other backups depend on](#scenario-9)
+    * [Scenario 10: Restore an incremental backup when its base is missing](#scenario-10)
+    * [Scenario 11: Make an incremental backup self-contained (rebase)](#scenario-11)
+    * [Scenario 12: Resume an interrupted incremental upload](#scenario-12)
+    * [Scenario 13: Incremental backups while ClickHouse merges parts](#scenario-13)
+    * [Scenario 14: Compare local-base and remote-base incremental backups](#scenario-14)
+    * [Scenario 15: Incremental backup of tables on S3 object disks](#scenario-15)
+    * [Scenario 16: Incremental backup using the embedded BACKUP engine](#scenario-16)
+    * [Scenario 17: Incremental backup limited to selected partitions](#scenario-17)
+    * [Scenario 18: Incremental backups on a two-node sharded cluster](#scenario-18)
+    * [Scenario 19: Incremental backup with a large amount of data](#scenario-19)
+    * [Scenario 20: Automatic incremental backup chains with `watch`](#scenario-20)
+    * [Scenario 21: How insert size and merges affect incremental backup size](#scenario-21)
 
 ## Introduction
 
-This test plan covers incremental backup testing of `clickhouse-backup`.
+This test plan describes how to test **incremental backups** in `clickhouse-backup`.
 
-The main goal of this test plan is to validate that `clickhouse-backup` produces correct, space-efficient
-incremental backups and can faithfully reconstruct ClickHouse data from a full backup plus a chain of
-increments.
+An incremental backup stores only the data that changed since a previous backup, instead of copying
+everything again. This makes backups faster and smaller. The previous backup an incremental backup is built on
+top of is called its **base backup**.
 
-To validate this, the following properties SHALL be checked:
+The goal of this plan is to confirm that:
 
-* **Delta correctness** — an incremental backup uploads only genuinely new data parts; parts already present
-  in the base backup are marked `required: true` in metadata and are NOT re-uploaded.
-* **Delta safety** — a part whose name matches a part in the base backup but whose content fingerprint
-  (`hash_of_all_files` / legacy `checksums`) differs MUST be re-uploaded, never deduplicated.
-* **Reconstruction fidelity** — restoring the tip of a backup chain reproduces the source data exactly
-  (row counts and content checksums match), resolving `required` parts up the whole chain.
-* **Chain integrity** — a backup referenced by another backup's `required_backup` pointer MUST NOT be deleted
-  by retention; `rebase` can flatten a chain into a self-contained backup.
-* **Resilience and scale** — interrupted incremental operations resume without re-uploading deduplicated
-  parts and without data loss, including when background merges occur, on large multi-shard clusters.
+* An incremental backup stores only the new or changed data, not the whole table again.
+* Restoring an incremental backup gives back exactly the same data as the original.
+* A part that changed but happens to keep the same name is still saved correctly (not mistaken for unchanged
+  data).
+* Backups that other backups depend on are not accidentally deleted.
+* Incremental backups keep working after interruptions, during background activity in ClickHouse, and on
+  larger amounts of data.
 
-## Testing Approach and Best Practices
+## How Incremental Backups Work in clickhouse-backup
 
-The scenarios in this plan follow the industry-standard method for validating incremental backups, adapted to
-`clickhouse-backup`'s part-level model. The same method is used to test other immutable-file / segment-based
-systems whose backup model is architecturally comparable to ClickHouse (e.g. Apache Cassandra / ScyllaDB
-hard-linked SSTable snapshots, Elasticsearch / OpenSearch incremental snapshots, Apache Druid / Pinot segment
-deep-storage backups). In all of these, "incremental" means *"store only the immutable files that did not exist
-in the previous backup"*, so the tests below are structured around the same principles.
+ClickHouse stores table data in immutable files on disk called **data parts**. A part is written once and is
+never modified in place; when data changes, ClickHouse writes new parts and eventually merges old ones into
+new ones.
 
-**The snapshot–mutate–snapshot–restore loop.** Every chain test establishes a known state, backs it up, mutates
-the data in a controlled way, takes an incremental backup, and restores the tip onto a clean target:
+`clickhouse-backup` uses this to make incremental backups: when it creates an incremental backup, it compares
+the current parts against the parts already saved in the base backup. Parts that already exist in the base
+backup are **reused** (their data is not uploaded again) and are simply marked as coming from the base backup.
+Only genuinely new parts are uploaded.
 
-```text
-state S0  → backup B0 (full)
-mutate → state S1  → backup B1 (incremental, base=B0)
-mutate → state S2  → backup B2 (incremental, base=B1)
-restore(B2) on a clean target → assert restored == S2
-```
+Because of this, an incremental backup on its own is not complete — it points to its base backup (and the base
+may point to an even earlier one, forming a **chain**). When restoring, `clickhouse-backup` collects the reused
+parts from the earlier backups in the chain automatically.
 
-**Two assertion levels.** Each scenario asserts at both levels, because a data-only check can pass while the
-feature is silently broken (an "increment" that secretly re-uploaded everything still restores correctly):
+The official description of this behavior is in the clickhouse-backup documentation (see
+[References](#references)).
 
-* **Black-box (data level):** restored row counts and content checksums equal the source.
-* **White-box (artifact level):** backup metadata proves the delta was computed correctly — correct
-  `required_backup` pointer, `required: true` on carried-over parts with no remote data objects for them, new
-  parts present, and increment `compressed_size` proportional to the actual change.
+## Testing Approach
 
-**Controlling non-determinism.** ClickHouse background merges rewrite/rename parts and are the main source of
-flakiness. Scenarios that assert on specific `required` flags control merges explicitly (stop merges, or insert
-into distinct partitions); scenarios that specifically test behavior under merges are called out.
+Each test follows the same simple idea:
 
-**Four properties, repeated in different shapes.** Delta correctness, reconstruction fidelity, chain integrity,
-and resilience/scale. The prioritized "must-have" scenarios that cover these four plus the single most dangerous
-bug (unsafe deduplication) are: [Single Increment — Happy Path](#single-increment-happy-path),
-[Fingerprint Mismatch Re-upload](#fingerprint-mismatch-re-upload),
-[Deep Chain Reconstruction](#deep-chain-reconstruction),
-[Retention Chain Protection](#retention-chain-protection), and
-[Missing Base — Negative Restore](#missing-base-negative-restore).
+1. Put a table into a known state and make a full backup (call it the **base state**).
+2. Change the data in a controlled way and make an incremental backup (**state 1**, **state 2**, and so on for
+   longer chains).
+3. Restore the latest backup onto an empty table (or a clean node) and check the result.
+
+For every test we confirm two things:
+
+* **The data is correct** — after restore, the table contains exactly the same rows as the original (checked by
+  comparing row counts and the actual row contents).
+* **Only the changes were stored** — the incremental backup is much smaller than a full backup would be. This
+  is visible from the reported backup size (for example in `clickhouse-backup list`). This matters because a
+  broken incremental backup that secretly copied everything would still restore correctly, so a data check
+  alone is not enough to prove the feature works.
+
+**A note on background merges.** ClickHouse merges parts in the background, which renames and rewrites them.
+This can change which parts count as "new" between two backups and is the main cause of unstable test results.
+Tests that need parts to stay stable stop merges (`SYSTEM STOP MERGES`) or insert into separate partitions so
+the changed parts are predictable. One test deliberately runs *with* merges to check behavior under that
+condition.
+
+The most important tests to run first (they cover the core promises and the riskiest failure) are
+[Scenario 1](#scenario-1), [Scenario 4](#scenario-4), [Scenario 6](#scenario-6), [Scenario 9](#scenario-9),
+and [Scenario 10](#scenario-10).
+
+## Scope and Relationship to Existing Tests
+
+The internal mechanics of incremental backups (how parts are marked as reused, checksums, object-disk copying,
+rebase internals) are already exercised by the Go integration tests under `test/integration/`, which run
+against a single ClickHouse node and inspect backup metadata directly.
+
+This plan focuses on **end-to-end, user-visible behavior** and on **multi-node scenarios** that the
+single-node integration tests cannot cover. Where a scenario overlaps with existing integration coverage, this
+is noted so the same thing is not tested twice for no reason.
 
 ## Timeline
 
-The testing of `clickhouse-backup` incremental backups SHALL be started on July 20.
-## Configuration Requirements
+The testing of `clickhouse-backup` incremental backups SHALL be started on July 20, 2026 and be completed by
+August 7, 2026.
 
-Incremental backups are computed at the level of immutable ClickHouse data parts. A backup carries a single
-`required_backup` pointer to its immediate parent, forming a linear chain (full → inc1 → inc2 → ...). The
-increment is calculated only while executing `upload` / `create_remote` (or the equivalent REST API calls);
-see [Documentation References](#documentation-references).
+## Commands and Options Used
 
-### Diff Modes
+Incremental backups are selected with one of two options that name the base backup:
 
-Two mutually-exclusive diff modes select the base backup:
+| Option | Where the base backup lives | Commands that accept it |
+| ------ | --------------------------- | ----------------------- |
+| `--diff-from-remote=<name>` | On remote storage (S3, FTP, etc.) | `create`, `create_remote`, `upload`, and the `watch` command |
+| `--diff-from=<name>` | In local backups only | `create_remote`, `upload` (not plain `create`) |
 
-| Mode | Base location | Dedup computed at | Notes |
-| ---- | ------------- | ----------------- | ----- |
-| `--diff-from-remote=<name>` | Remote storage | `create` and/or `upload` | Requires `general.upload_by_part: true`. Used by `create`, `create_remote`, `upload`, and automatic `watch`. |
-| `--diff-from=<name>` | Local only | `upload` | Base backup MUST exist as a local backup; dedup and fingerprint verification happen during upload. |
+Other relevant options and settings:
 
-### Relevant Configuration Options
-
-| Option | Purpose | Default |
-| ------ | ------- | ------- |
-| `general.upload_by_part` | MUST be `true` for remote incremental backups (per-part upload/dedup) | `true` |
-| `general.backups_to_keep_remote` | Remote retention count; MUST protect backups referenced by a chain | `0` (keep all) |
-| `general.rebase_before_remove_old_remote` | Rebase the oldest kept increment before pruning ancestors | `false` |
-| `use_embedded_backup_restore` | Switch to ClickHouse-native incremental (`BACKUP ... SETTINGS base_backup=...`) | `false` |
-| `general.upload_concurrency` / `general.download_concurrency` | Parallel part streams; primary throughput knobs for large data | tune to hardware |
-| `s3.http_max_idle_conns_per_host` | Critical for saturating parallel streams to one endpoint (Go default is 2) | tune to hardware |
+| Name | Purpose |
+| ---- | ------- |
+| `upload_by_part` (config) | Must be `true` to use `--diff-from-remote`; it is `true` by default |
+| `backups_to_keep_remote` (config) | How many remote backups to keep; must not delete backups still needed by a chain |
+| `--partitions` | Limit a backup or restore to selected partitions |
+| `rebase` (command) | Turn an incremental backup into a self-contained one (see [Scenario 11](#scenario-11)) |
+| `use_embedded_backup_restore` (config) | Use ClickHouse's built-in BACKUP engine instead of the file-level approach (see [Scenario 16](#scenario-16)) |
 
 ## Test Environment
 
-The following artifacts and tools will be used:
+The tests use the standard TestFlows environment for `clickhouse-backup`, which starts:
 
-* `clickhouse-backup` binary under test (regular, non-FIPS build).
-* A ClickHouse server image supporting immutable-part `MergeTree` freezing (CH ≥ 21.4 for `os.Link`-based
-  hardlinks of frozen shadow parts).
-* At least one object-store remote backend (e.g. S3 / MinIO) and one file-protocol backend (e.g. SFTP or FTP),
-  each using an isolated storage prefix/bucket per test run.
-* A clean, separate ClickHouse instance (or a fresh multi-shard cluster) used exclusively as the restore
-  target, to prove that a chain is self-sufficient.
-* A deterministic dataset generator allowing control over which parts change between backups
-  (insert into distinct partitions; `SYSTEM STOP MERGES` to keep parts stable; `OPTIMIZE ... FINAL` to force
-  part churn).
+* Two ClickHouse nodes, `clickhouse1` and `clickhouse2`, and a ZooKeeper node for coordination.
+* A `clickhouse_backup` container running the `clickhouse-backup` binary under test.
+* Remote storage backends available in the environment (for example MinIO for S3, plus FTP and SFTP servers).
 
-> [!NOTE]
-> Background merges rename/rewrite parts and are the main source of flakiness in incremental tests.
-> Scenarios that assert on specific `required` flags MUST control merges explicitly (stop merges or use
-> distinct partitions) unless the scenario's purpose is to test behavior under merges. This behavior is
-> documented: the size of an increment depends on both ingest intensity and background-merge intensity
-> (see [Documentation References](#documentation-references)).
-
-## Terminology and Backup Chain Model
-
-* **Full backup** — `required_backup` is empty; all parts stored in this backup.
-* **Increment** — `required_backup` points at the immediate parent; parts already in the chain are
-  `required: true` and stored only in an ancestor.
-* **Chain** — the transitive closure of `required_backup` pointers from a backup up to its full base.
-* **Rebase** — copying required parts into an increment so it no longer depends on ancestors
-  (`required_backup` cleared, per-part `required` flags cleared).
-
-## Metadata Assertion Model
-
-Every scenario that verifies delta correctness SHALL inspect backup metadata, not only restored data.
-
-Top-level `backup_name/metadata.json` fields:
-
-| Field | Meaning | Typical assertion |
-| ----- | ------- | ----------------- |
-| `required_backup` | Immediate parent (empty = full) | Points at the expected base |
-| `data_size` | Local shadow size at create | Present |
-| `compressed_size` | Bytes actually uploaded | Increment ≪ full backup |
-| `object_disk_size` | Object-disk blob bytes uploaded | Zero for fully-deduped object-disk parts |
-| `data_format` | Compression format or `directory` | As configured |
-
-Per-part metadata (`backup_name/metadata/<db>/<table>.json`, `Part` entries):
-
-| Field | Meaning | Typical assertion |
-| ----- | ------- | ----------------- |
-| `name` | Part name | — |
-| `required` | `true` → data lives in an ancestor, not this backup | Carried-over parts `true`; new/changed parts absent/`false` |
-
-The part-level dedup decision uses `hash_of_all_files` (falling back to legacy `checksums`) so a name match with
-a content change is NOT deduplicated (see [Implementation References](#implementation-references)).
+Most single-node scenarios run on `clickhouse1`. Scenarios that need more than one node (for example the
+sharded-cluster scenario) use both `clickhouse1` and `clickhouse2` via the predefined `sharded_cluster`
+configuration. To confirm a restore is complete, tests drop the table (or use a clean node) and restore into
+an empty target.
 
 ## References
 
-All claims and expected behaviors in this plan are derived from the `clickhouse-backup` source code and official
-documentation listed below. Line numbers are indicative of the version at the time of writing and may drift.
+The following stable sources describe the behavior tested here:
 
-### Implementation References
-
-| Behavior | Location |
-| --- | --- |
-| `create` entry point with `diffFromRemote` | `pkg/backup/create.go` — `CreateBackup(...)` (~line 63) |
-| `create_remote` = create + upload | `pkg/backup/create_remote.go` (~lines 11–31) |
-| `upload` entry point with `diffFrom` / `diffFromRemote` | `pkg/backup/upload.go` — `Upload(...)` (~line 38) |
-| `upload_by_part` required for remote incremental | `pkg/backup/upload.go` (~lines 433–434); default in `pkg/config/config.go` (~line 836) |
-| Load base table metadata from remote / local | `pkg/backup/backuper.go` — `getTablesDiffFromRemote` (~531–561), `getTablesDiffFromLocal` (~508) |
-| Part-name dedup at create (skip hardlink for required) | `pkg/filesystemhelper/filesystemhelper.go` — `addRequiredPartIfNotExists` (~467–491) |
-| Fingerprint validation / demote `Required` on mismatch (issue #1307) | `pkg/backup/create.go` (~1081–1111) |
-| Part-name + fingerprint dedup at upload | `pkg/backup/upload.go` — `markDuplicatedParts` (~832–878); skip upload of required parts (~929–935) |
-| Move/hardlink frozen shadow to local backup | `pkg/filesystemhelper/filesystemhelper.go` — `MoveShadowToBackup` (~274–366), `LinkPartFromShadow` (~368–407) |
-| Object-disk blobs skipped for required parts | `pkg/backup/create.go` — `uploadObjectDiskParts` (~1332–1344) |
-| Embedded incremental via `base_backup` | `pkg/backup/create.go` (~683–689) |
-| Top-level metadata `RequiredBackup` written | `pkg/backup/create.go` — `createBackupMetadata` (~1450–1457); final remote metadata `pkg/backup/upload.go` (~256–270) |
-| Recursive download of `RequiredBackup` chain (issue #1384) | `pkg/backup/download.go` (~184–196) |
-| Restore resolution of required parts (hardlink or download) | `pkg/backup/restore.go` — `prepareRequiredPartsForRestore` / `restoreRequiredPart` (~2381–2445) |
-| Retention protects referenced chains | `pkg/storage/compression.go` — `GetBackupsToDeleteRemote` (~29–62) |
-| Rebase copies required parts server-side, clears deps | `pkg/backup/rebase.go` |
-| Metadata structs | `pkg/metadata/backup_metadata.go`, `table_metadata.go`, `part_metadata.go` |
-| CLI flags (`--diff-from`, `--diff-from-remote`, `rebase`, `watch`) | `cmd/clickhouse-backup/main.go` |
-
-### Documentation References
-
-| Topic | Location |
-| --- | --- |
-| How incremental backups work with remote storage (part-level vs embedded, `required_backup`, recursive download, increment size vs merges) | `Examples.md` (~1195–1216) |
-| How `watch` builds full + incremental sequences | `Examples.md` (~1230–1233) |
-| Back up / restore a sharded cluster (per-shard, first-replica-per-shard, schema-on-all / data-on-first) | `Examples.md` (~80–108) |
-| Sharded cluster incremental with Ansible (full on day 1, increments otherwise, `--diff-from`) | `Examples.md` (~110–146) |
-| Performance tuning for large data (concurrency, `http_max_idle_conns_per_host`, compression) | `Examples.md` (~164–227) |
-| CLI help: `create`, `create_remote`, `upload`, `rebase`, `watch` flags incl. `--partitions`, `full_type=rebase`, `delete_previous_cycle` | `Manual.md` (~31, 66, 103, 168–174, 375–393) |
-| Requirements specification (RQ.SRS-013 IncrementalBackups) | `test/testflows/clickhouse_backup/requirements/requirements.md` |
+* clickhouse-backup project and documentation: <https://github.com/Altinity/clickhouse-backup>
+* How incremental backups work with remote storage:
+  <https://github.com/Altinity/clickhouse-backup/blob/master/Examples.md#how-incremental-backups-work-with-remote-storage>
+* Commands and options (`create`, `create_remote`, `upload`, `restore`, `rebase`, `watch`, `--diff-from`,
+  `--diff-from-remote`, `--partitions`): <https://github.com/Altinity/clickhouse-backup/blob/master/Manual.md>
+* Changelog: <https://github.com/Altinity/clickhouse-backup/blob/master/ChangeLog.md>
 
 ## Human Resources And Assignments
 
@@ -210,421 +179,431 @@ The following team members SHALL be dedicated to this effort:
 
 ---
 
-## Single Increment — Happy Path
+## Test Scenarios
 
-**Objective:** Verify a full backup followed by one incremental backup deduplicates unchanged parts and
-restores correctly.
+### Scenario 1: Create and restore a single incremental backup
+<a id="scenario-1"></a>
 
-**Steps:**
-
-1. Create a `MergeTree` table partitioned by a controllable key; insert dataset A into partition `p1`.
-2. `create_remote <full>`.
-3. Insert dataset B into a new partition `p2` (new parts only).
-4. `create_remote --diff-from-remote=<full> <inc1>`.
-5. On a clean ClickHouse instance, `restore_remote <inc1>`.
-
-**Expected result:**
-
-| Test Assertion | Expected Result |
-| --- | --- |
-| Parent pointer | `<inc1>` metadata `required_backup == <full>` |
-| Old parts deduplicated | Parts of `p1` marked `required: true`; no remote data objects for them under `<inc1>` |
-| New parts uploaded | Parts of `p2` not `required`; present in remote data of `<inc1>` |
-| Size efficiency | `<inc1>` `compressed_size` materially smaller than `<full>` |
-| Data fidelity | Restored row count and content checksum equal source (A ∪ B) |
-
-## Pure Additions Deduplication
-
-**Objective:** Verify that when only new parts are added, all base parts are deduplicated.
+**Goal:** Confirm the basic flow works — a full backup, then one incremental backup, then a correct restore.
 
 **Steps:**
 
-1. `create_remote <full>` over dataset A.
-2. Insert only into new partitions (no changes to existing parts); stop merges to keep base parts stable.
-3. `create_remote --diff-from-remote=<full> <inc>`.
+1. Create a partitioned `MergeTree` table and insert a first batch of data.
+2. Make a full remote backup: `create_remote base_backup`.
+3. Insert a second batch of data into a new partition.
+4. Make an incremental backup: `create_remote --diff-from-remote=base_backup inc_backup`.
+5. Drop the table and restore the incremental backup: `restore_remote inc_backup`.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Full dedup of base | Every base part is `required: true` in `<inc>` |
-| Only new parts stored | Only the newly-inserted parts have remote data objects |
-| Restore | Tip restore equals source |
+| Check | Expected |
+| ----- | -------- |
+| Data after restore | The table contains both batches of data, identical to before the drop |
+| Backup size | `inc_backup` is much smaller than `base_backup` (only the new data was stored) |
 
-## No-op Increment
+### Scenario 2: Incremental backup after adding new data
+<a id="scenario-2"></a>
 
-**Objective:** Verify an increment taken with no data changes stores ~zero data and still restores the full
-state.
+**Goal:** Confirm that when only new data is added, the unchanged data is reused (deduplicated) and not stored
+again.
 
 **Steps:**
 
-1. `create_remote <full>` over dataset A; stop merges.
-2. Without any changes, `create_remote --diff-from-remote=<full> <inc>`.
-3. `restore_remote <inc>` on a clean instance.
+1. Full backup of a table with data in partition A.
+2. Stop merges, then insert new data only into a new partition B.
+3. `create_remote --diff-from-remote=<full> inc_backup`.
+4. Restore `inc_backup` onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| All parts required | Every part in `<inc>` is `required: true` |
-| Near-zero payload | `<inc>` `compressed_size` ≈ metadata-only |
-| Restore | Restored data equals dataset A |
+| Check | Expected |
+| ----- | -------- |
+| Data after restore | Both partitions A and B are present and correct |
+| Backup size | The incremental backup size corresponds roughly to partition B only |
 
-## Fingerprint Mismatch Re-upload
+### Scenario 3: Incremental backup when nothing changed
+<a id="scenario-3"></a>
 
-**Objective:** Verify the delta-safety invariant — a part with the same name but different content is
-re-uploaded, not deduplicated. (Highest-risk correctness case; see issue #1307 in
-[Implementation References](#implementation-references).)
+**Goal:** Confirm that an incremental backup taken with no data changes stores almost nothing but still
+restores the full data.
 
 **Steps:**
 
-1. `create_remote <full>` over dataset A.
-2. Force a part to change contents while keeping (or colliding on) its name — e.g. `OPTIMIZE TABLE ... FINAL`
-   or a mutation that rewrites an existing partition.
-3. `create_remote --diff-from-remote=<full> <inc>`.
-4. `restore_remote <inc>` on a clean instance.
+1. Full backup of a table; stop merges so parts stay identical.
+2. Without changing any data, `create_remote --diff-from-remote=<full> inc_backup`.
+3. Restore `inc_backup` onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Mismatch detected | The changed part is NOT `required`; it is uploaded to `<inc>` |
-| Fingerprint basis | Decision driven by differing `hash_of_all_files` / `checksums`, not just name |
-| Data fidelity | Restore reflects the changed (post-`OPTIMIZE`/mutation) content, not stale base content |
+| Check | Expected |
+| ----- | -------- |
+| Backup size | The incremental backup is nearly empty (only bookkeeping, no data) |
+| Data after restore | The table matches the original data exactly |
 
-## Dropped Partition / Deletions
+### Scenario 4: A changed part with the same name is uploaded again
+<a id="scenario-4"></a>
 
-**Objective:** Verify that dropping data before an increment is reflected on restore.
+**Goal:** Confirm the most important safety rule — if a part changed but happens to have the same name as one
+in the base backup, its new content is uploaded, not skipped. (clickhouse-backup detects this by comparing the
+part's file checksums, not just its name.)
 
 **Steps:**
 
-1. `create_remote <full>` over partitions `p1`, `p2`.
-2. `ALTER TABLE ... DROP PARTITION p2`.
-3. `create_remote --diff-from-remote=<full> <inc>`.
-4. `restore_remote <inc>` on a clean instance.
+1. Full backup of a table with data in one partition.
+2. Force that data to be rewritten while keeping the same partition, for example `OPTIMIZE TABLE ... FINAL` or a
+   data mutation.
+3. `create_remote --diff-from-remote=<full> inc_backup`.
+4. Restore `inc_backup` onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Retained parts | `p1` parts `required: true` |
-| Dropped data absent | Restored table contains only `p1`; `p2` data absent |
+| Check | Expected |
+| ----- | -------- |
+| Data after restore | The restored data reflects the rewritten content, not the old content |
+| Backup content | The changed data was actually stored in the incremental backup (it was not skipped as "unchanged") |
 
-## Deep Chain Reconstruction
+### Scenario 5: Incremental backup after deleting data
+<a id="scenario-5"></a>
 
-**Objective:** Verify recursive resolution of required parts across a chain deeper than two.
+**Goal:** Confirm that deleting data (dropping a partition) before an incremental backup is reflected on
+restore.
 
 **Steps:**
 
-1. Build chain: `create_remote <full>` → `--diff-from-remote=<full> <inc1>` → `--diff-from-remote=<inc1> <inc2>`
-   → `--diff-from-remote=<inc2> <inc3>`, each adding a new partition.
-2. `restore_remote <inc3>` on a clean instance.
+1. Full backup of a table with partitions A and B.
+2. `ALTER TABLE ... DROP PARTITION B`.
+3. `create_remote --diff-from-remote=<full> inc_backup`.
+4. Restore `inc_backup` onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Chain pointers | Each increment's `required_backup` points at its immediate parent |
-| Recursive resolution | Download/restore pulls required parts from ancestors up the whole chain |
-| Data fidelity | Restored data equals the accumulated state at `<inc3>` |
+| Check | Expected |
+| ----- | -------- |
+| Data after restore | Only partition A is present; partition B is gone |
 
-## Restore of an Intermediate Increment
+### Scenario 6: Restore from a long chain of incremental backups
+<a id="scenario-6"></a>
 
-**Objective:** Verify restoring a non-tip increment yields that increment's point-in-time state.
+**Goal:** Confirm that a chain of several incremental backups can be restored correctly, collecting reused
+parts from all earlier backups in the chain.
 
 **Steps:**
 
-1. Build chain `full` → `inc1` → `inc2` → `inc3` (as above).
-2. `restore_remote <inc1>` on a clean instance.
+1. Full backup (`base_backup`).
+2. Add data and make `inc1` based on `base_backup`.
+3. Add more data and make `inc2` based on `inc1`.
+4. Add more data and make `inc3` based on `inc2`.
+5. Restore the newest backup `inc3` onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Point-in-time state | Restored data equals state as of `<inc1>` (not `<inc2>`/`<inc3>`) |
+| Check | Expected |
+| ----- | -------- |
+| Data after restore | The table contains all data added across the full backup and every increment |
+| Chain used | The restore automatically pulls the reused parts from the earlier backups in the chain |
 
-## Local Hardlink vs Remote Download Resolution
+### Scenario 7: Restore an earlier backup in the chain
+<a id="scenario-7"></a>
 
-**Objective:** Verify both required-part resolution paths (local hardlink and remote download) produce
-identical results.
+**Goal:** Confirm that restoring a backup from the middle of a chain gives the data as it was at that point in
+time, not the latest data.
 
 **Steps:**
 
-1. Build `full` → `inc1` on remote.
-2. Case A (hardlink): ensure `<full>` is present locally, then download/restore `<inc1>` so required parts are
-   hardlinked from the local base.
-3. Case B (download): with no local base present, download/restore `<inc1>` so required parts are downloaded
-   from remote.
+1. Build the chain `base_backup` → `inc1` → `inc2` → `inc3` as in Scenario 6.
+2. Restore `inc1` (not the newest) onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Case A | Required parts resolved via local hardlink; restore equals source |
-| Case B | Required parts resolved via remote download; restore equals source |
-| Equivalence | Both cases produce identical restored data |
+| Check | Expected |
+| ----- | -------- |
+| Data after restore | The table matches the data as it was when `inc1` was taken (not `inc2` or `inc3`) |
 
-## Retention Chain Protection
+### Scenario 8: Restore reused parts from a local backup or by download
+<a id="scenario-8"></a>
 
-**Objective:** Verify retention never deletes a backup referenced by a `required_backup` chain.
+**Goal:** Confirm that restore works whether the base backup's data is already present locally or has to be
+downloaded from remote storage.
 
 **Steps:**
 
-1. Build a 5-backup chain via `--diff-from-remote`.
-2. Set `general.backups_to_keep_remote = 3` (or `BACKUPS_TO_KEEP_REMOTE=3`) and run remote cleanup.
-3. Download and restore the latest backup on a clean instance.
+1. Build `base_backup` → `inc1` on remote storage.
+2. Case A: keep `base_backup` present locally, then restore `inc1` (reused parts come from the local base).
+3. Case B: with no local backups present, restore `inc1` (reused parts are downloaded from remote).
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Referenced ancestors kept | Backups still referenced by the kept chain are NOT deleted, even if outside the keep window |
-| Latest restorable | Downloading the latest backup pulls its full chain and restores successfully |
+| Check | Expected |
+| ----- | -------- |
+| Case A | Restore succeeds; data matches the original |
+| Case B | Restore succeeds; data matches the original |
+| Both cases | Produce identical restored data |
 
-## Missing Base — Negative Restore
+### Scenario 9: Keep backups that other backups depend on
+<a id="scenario-9"></a>
 
-**Objective:** Verify that restoring an increment whose base is missing fails cleanly with a clear error.
+**Goal:** Verify retention never deletes a backup that a later incremental backup still depends on.
 
 **Steps:**
 
-1. Build `full` → `inc1`.
-2. Delete `<full>` from remote (bypassing chain protection, e.g. explicit delete) so the chain is broken.
-3. Attempt `restore_remote <inc1>` on a clean instance.
+1. Build a chain of 5 backups using `--diff-from-remote`.
+2. Set `backups_to_keep_remote = 3` and run the remote cleanup.
+3. Download and restore the latest backup onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Clean failure | The operation exits non-zero with a specific error referencing the missing required backup |
-| No silent partial restore | No partial/corrupt table is left presented as a successful restore; no crash |
+| Check | Expected |
+| ----- | -------- |
+| Backups kept | Older backups that the kept chain still needs are NOT deleted, even though the limit is 3 |
+| Data after restore | The latest backup restores correctly using its full chain |
 
-## Rebase / Chain Flattening
+### Scenario 10: Restore an incremental backup when its base is missing
+<a id="scenario-10"></a>
 
-**Objective:** Verify `rebase` makes an increment self-contained and restorable after ancestors are removed.
+**Goal:** Confirm that if the base backup is missing, restoring the incremental backup fails clearly instead of
+producing wrong or partial data.
 
 **Steps:**
 
-1. Build `full` → `inc1` → `inc2`.
-2. `rebase <inc2>` (CLI or `POST /backup/rebase/{name}`).
-3. Delete ancestors `<full>` and `<inc1>`.
-4. `restore_remote <inc2>` on a clean instance.
+1. Build `base_backup` → `inc1`.
+2. Delete `base_backup` from remote storage so the chain is broken.
+3. Attempt to restore `inc1`.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Flattened metadata | `<inc2>` `required_backup` cleared; previously `required` parts now stored in `<inc2>` |
-| Self-sufficient restore | Restore succeeds after ancestors deleted; data equals state at `<inc2>` |
+| Check | Expected |
+| ----- | -------- |
+| Result | The restore fails with a clear error that names the missing base backup |
+| No bad data | No half-restored or corrupted table is left behind; the tool does not crash |
 
-## Resume After Interruption
+### Scenario 11: Make an incremental backup self-contained (rebase)
+<a id="scenario-11"></a>
 
-**Objective:** Verify an interrupted incremental upload resumes without re-uploading deduplicated parts.
+**Goal:** Confirm the `rebase` command turns an incremental backup into a complete, standalone backup so it no
+longer needs its earlier backups. ("Rebase" here means copying the reused parts into the incremental backup
+itself.)
 
 **Steps:**
 
-1. `create_remote <full>`; add new partitions.
-2. Start `upload --diff-from-remote=<full> <inc>` and interrupt it mid-upload (kill/restart).
-3. Re-run the same upload to resume.
-4. `restore_remote <inc>` on a clean instance.
+1. Build `base_backup` → `inc1` → `inc2`.
+2. Run `rebase inc2`.
+3. Delete the earlier backups `base_backup` and `inc1`.
+4. Restore `inc2` onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Resume completes | Upload finishes on retry without error |
-| No redundant work | Deduplicated (`required`) parts are not uploaded on resume |
-| Data fidelity | Final restore equals source |
+| Check | Expected |
+| ----- | -------- |
+| After rebase | `inc2` no longer depends on any earlier backup |
+| Data after restore | `inc2` restores correctly even though its earlier backups were deleted |
 
-## Concurrent Merges During Chain
+### Scenario 12: Resume an interrupted incremental upload
+<a id="scenario-12"></a>
 
-**Objective:** Verify chain integrity when background merges rewrite parts between backups.
+**Goal:** Confirm that an incremental backup upload that is interrupted can resume and finish correctly without
+re-uploading data it already handled.
 
 **Steps:**
 
-1. `create_remote <full>` with merges enabled.
-2. Allow/trigger background merges, insert new data, then `create_remote --diff-from-remote=<full> <inc>`.
-3. `restore_remote <inc>` on a clean instance.
+1. Full backup, then add new data.
+2. Start uploading the incremental backup and interrupt it partway (stop/restart the process).
+3. Run the same upload again to let it resume.
+4. Restore the finished incremental backup onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Correct dedup under churn | Merged (renamed/rewritten) parts are treated as new via fingerprint; unchanged parts still deduplicated |
-| Data fidelity | Restored data equals source despite merges |
+| Check | Expected |
+| ----- | -------- |
+| Resume | The second run completes the backup without errors |
+| No repeated work | Data already uploaded (and reused parts) are not uploaded again |
+| Data after restore | The restored data matches the original |
 
-## Diff Mode Matrix
+### Scenario 13: Incremental backups while ClickHouse merges parts
+<a id="scenario-13"></a>
 
-**Objective:** Verify `--diff-from` (local base) and `--diff-from-remote` (remote base) behave equivalently
-for the same data changes.
+**Goal:** Confirm the chain still restores correctly when ClickHouse merges parts in the background between
+backups (merges rename and rewrite parts).
 
 **Steps:**
 
-1. For each mode, build `full` → `inc` over identical data changes:
-   * `--diff-from-remote`: dedup at create/upload against the remote base.
-   * `--diff-from`: keep `<full>` locally; `upload --diff-from=<full>` dedups at upload.
-2. Restore each `<inc>` on a clean instance.
+1. Full backup with merges enabled.
+2. Allow or trigger background merges, add some new data, then make an incremental backup.
+3. Restore the incremental backup onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Equivalent dedup | Both modes mark the same parts `required` and upload the same new parts |
-| Equivalent restore | Both restored datasets equal the source and each other |
+| Check | Expected |
+| ----- | -------- |
+| Data after restore | The restored data matches the original despite the merges |
 
-## Object-Disk Increment
+### Scenario 14: Compare local-base and remote-base incremental backups
+<a id="scenario-14"></a>
 
-**Objective:** Verify blob deduplication for `required` parts on object-disk-backed tables.
+**Goal:** Confirm that both ways of choosing a base backup — a local base (`--diff-from`) and a remote base
+(`--diff-from-remote`) — produce the same result for the same data changes.
 
 **Steps:**
 
-1. Create an object-disk-backed table; `create_remote <full>`.
-2. Add new parts; `create_remote --diff-from-remote=<full> <inc>`.
-3. `restore_remote <inc>` on a clean instance.
+1. Make the same data change on top of the same full backup twice, once for each option:
+   * with `--diff-from-remote=<full>`;
+   * with `--diff-from=<full>` (keeping the full backup available locally).
+2. Restore each incremental backup onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Blob dedup | Object-disk blobs for `required` parts are skipped (`object_disk_size` reflects only new blobs) |
-| Data fidelity | Restore equals source |
+| Check | Expected |
+| ----- | -------- |
+| Both options | Store only the changed data and restore correctly |
+| Comparison | Both restored tables contain identical data |
 
-## Embedded Incremental Backup
+### Scenario 15: Incremental backup of tables on S3 object disks
+<a id="scenario-15"></a>
 
-**Objective:** Verify the ClickHouse-native incremental path (`use_embedded_backup_restore: true`), which
-deduplicates at the file/checksum level via `BACKUP ... SETTINGS base_backup=...`.
+**Goal:** Confirm incremental backups work for tables whose data is stored on an S3 object disk inside
+ClickHouse, reusing unchanged data instead of copying it again.
+
+> Note: This overlaps with existing Go integration coverage of object-disk incremental backups; it is included
+> here for the end-to-end / multi-node environment.
 
 **Steps:**
 
-1. With `use_embedded_backup_restore: true`, `create_remote <full>`.
-2. Add data; `create_remote --diff-from-remote=<full> <inc>` (issues `BACKUP ... SETTINGS base_backup=<full>`).
-3. `restore_remote <inc>` on a clean instance.
+1. Create a table that uses an S3 object-disk storage policy; make a full remote backup.
+2. Add new data, then make an incremental backup with `--diff-from-remote`.
+3. Restore the incremental backup onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Native base backup used | Increment created against the base via ClickHouse `base_backup` setting |
-| Efficiency | Increment stores only changed files/checksums relative to the base |
-| Data fidelity | Restore equals source |
+| Check | Expected |
+| ----- | -------- |
+| Reuse | Unchanged object-disk data is reused, not copied again (incremental backup stays small) |
+| Data after restore | The restored data matches the original |
 
-## Partition-Scoped Increment
+### Scenario 16: Incremental backup using the embedded BACKUP engine
+<a id="scenario-16"></a>
 
-**Objective:** Verify `--partitions` restricts an incremental backup to selected partitions while preserving
-correct dedup and restore. (`--partitions` is supported by `create` / `create_remote` / `upload`; see
-[Documentation References](#documentation-references).)
+**Goal:** Confirm incremental backups work when `clickhouse-backup` uses ClickHouse's built-in `BACKUP`
+command (the "embedded" mode, enabled by `use_embedded_backup_restore: true`). In this mode ClickHouse itself
+computes the difference against the base backup.
 
 **Steps:**
 
-1. Create a table with partitions `p1`, `p2`, `p3`; `create_remote <full>`.
-2. Add data to `p2` and `p3`; `create_remote --diff-from-remote=<full> --partitions=p2,p3 <inc>`.
-3. `restore_remote --partitions=p2,p3 <inc>` on a clean instance.
+1. With `use_embedded_backup_restore: true`, make a full remote backup.
+2. Add data, then make an incremental backup with `--diff-from-remote`.
+3. Restore the incremental backup onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Scope respected | Only `p2`/`p3` parts are considered; `p1` is not backed up in `<inc>` |
-| Dedup within scope | Unchanged in-scope parts marked `required`; changed/new in-scope parts uploaded |
-| Restore | Restored `p2`/`p3` data equals source |
+| Check | Expected |
+| ----- | -------- |
+| Reuse | The incremental backup stores only the changes relative to the base |
+| Data after restore | The restored data matches the original |
 
-## Sharded Cluster Incremental Backup
+> Note: Embedded mode does not support sharded-operation mode, so this scenario is single-node only.
 
-**Objective:** Verify per-shard incremental backup chains on a sharded cluster restore correctly, following the
-documented sharded-cluster workflow (run on the first replica per shard; restore schema on all replicas, data on
-first replica per shard). See [Documentation References](#documentation-references).
+### Scenario 17: Incremental backup limited to selected partitions
+<a id="scenario-17"></a>
+
+**Goal:** Confirm that `--partitions` can limit an incremental backup to specific partitions and still restore
+those partitions correctly.
 
 **Steps:**
 
-1. Deploy a multi-shard cluster (e.g. 2 shards × 2 replicas) with `{shard}` in the remote `S3_PATH`.
-2. On the first replica of each shard, create a per-shard full backup:
-   `create_remote shard${shard}-full`.
-3. Ingest new data on each shard, then create a per-shard increment:
-   `create_remote --diff-from-remote=shard${shard}-full shard${shard}-inc1`.
-4. On a fresh cluster of the same topology, restore schema on all replicas then data on the first replica per
-   shard: `restore_remote --schema shard${shard}-inc1` (all replicas) then `restore_remote shard${shard}-inc1`
-   (first replica per shard).
+1. Create a table with partitions A, B, and C; make a full backup.
+2. Add data to B and C, then make an incremental backup with `--diff-from-remote` and `--partitions=B,C`.
+3. Restore the selected partitions onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Per-shard chains | Each shard has an independent `full → inc1` chain under its own `{shard}` remote path |
-| Per-shard dedup | Each increment deduplicates its own base; unchanged parts `required` |
-| Cluster fidelity | Aggregated restored data across shards equals the source cluster's data |
-| Replicated schema | Schema present on all replicas; data present on the first replica per shard |
+| Check | Expected |
+| ----- | -------- |
+| Scope | Only partitions B and C are included in the incremental backup |
+| Data after restore | The restored data for B and C matches the original |
 
-## Large-Scale Cluster Data Volume
+### Scenario 18: Incremental backups on a two-node sharded cluster
+<a id="scenario-18"></a>
 
-**Objective:** Verify incremental backups remain correct and space/time-efficient at scale on a cluster holding
-a large amount of data (many partitions, many parts, large total size), including throughput tuning and resume
-under load.
+**Goal:** Confirm per-node incremental backups work on the two-node sharded cluster and restore correctly.
+(The environment provides a 2-shard cluster: `clickhouse1` and `clickhouse2`, one shard each.)
 
 **Steps:**
 
-1. Deploy a multi-shard cluster and load a large dataset (e.g. billions of rows across hundreds of partitions,
-   totaling a large on-disk size per shard). Record baseline size via `system.parts`.
-2. Configure throughput knobs for large data:
-   `upload_concurrency` / `download_concurrency` raised, `s3.http_max_idle_conns_per_host` raised, and a
-   suitable `compression_*` profile (see [Documentation References](#documentation-references)).
-3. Per shard, `create_remote shard${shard}-full`; record duration and `compressed_size`.
-4. Mutate a small, known fraction of the data (append to a few new partitions and/or `OPTIMIZE FINAL` a few
-   existing partitions), then per shard
-   `create_remote --diff-from-remote=shard${shard}-full shard${shard}-inc1`; record duration and
-   `compressed_size`.
-5. During the increment upload, interrupt and resume once (`--resumable`) to exercise resume at scale.
-6. On a fresh cluster, download and `restore_remote` the latest per-shard increment.
+1. Using the `sharded_cluster` configuration, create a table on both nodes and insert different data on each
+   shard.
+2. On each node, make a full backup, then add data and make an incremental backup with `--diff-from-remote`,
+   using a per-node backup name.
+3. On a clean cluster, restore the schema on both nodes, then restore the data on each node from its own
+   incremental backup.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Proportional delta | Increment `compressed_size` and duration are proportional to the *changed* data, not the total dataset size (orders of magnitude smaller than the full backup) |
-| Dedup at scale | The large majority of parts across all shards are marked `required`; only changed/new parts uploaded |
-| Resume at scale | Interrupted upload resumes without re-uploading already-uploaded or deduplicated parts |
-| Throughput | Backup/restore complete within expected time given the configured concurrency; no connection-pool starvation errors |
-| Data fidelity | Full row-count and content-checksum comparison per shard equals the source after restore |
-| Stability | No out-of-memory / disk-exhaustion; local shadow and temp space bounded (required parts not hardlinked/downloaded unnecessarily) |
+| Check | Expected |
+| ----- | -------- |
+| Per-node chains | Each node has its own full → incremental chain |
+| Data after restore | The combined data across both shards matches the original cluster data |
 
-## Watch / Scheduled Increment Chain
+### Scenario 19: Incremental backup with a large amount of data
+<a id="scenario-19"></a>
 
-**Objective:** Verify the `watch` / scheduled workflow builds a full + incremental chain and manages retention,
-including `full_type=rebase` and `delete_previous_cycle`. See [Documentation References](#documentation-references).
+**Goal:** Confirm incremental backups stay correct and efficient when the table holds a large amount of data,
+so that only the changed portion is transferred.
 
 **Steps:**
 
-1. Start `watch` with a short `--watch-interval` and `--full-interval` (or a `--schedule` cron chain), with
-   `backups_to_keep_remote` set.
-2. Ingest data between intervals so each cycle produces a new increment (auto `--diff-from-remote=<previous>`),
-   with a periodic full backup.
-3. For a scheduled chain, also exercise `full_type=rebase` and `delete_previous_cycle=true`.
-4. After several cycles, restore the latest backup on a clean instance.
+1. Launch the test environment and load a large but practical dataset into a table (for example tens of
+   millions of rows across many partitions — large enough to be meaningful, small enough to finish in CI).
+   Record the table size from `system.parts`.
+2. Make a full remote backup and record how long it takes and how large it is.
+3. Change only a small, known part of the data (add a few new partitions and/or rewrite a couple of existing
+   ones), then make an incremental backup and record its time and size.
+4. Restore the latest incremental backup onto a clean node and compare the data.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Chain built | Increments reference the previous backup; a full backup is created every `full-interval` |
-| Rebase full type | With `full_type=rebase`, the scheduled full is produced by increment + server-side rebase instead of a full re-upload |
-| Retention | Old backups without references are deleted; referenced chains are preserved; `delete_previous_cycle` removes the prior cycle after a successful full |
-| Restore | Latest backup restores correctly |
+| Check | Expected |
+| ----- | -------- |
+| Small delta | The incremental backup is far smaller and faster than the full backup, in proportion to the small change |
+| Reuse | Most of the data is reused from the full backup, not copied again |
+| Data after restore | Row counts and row contents match the original |
+| Stability | The run completes without running out of memory or disk space |
 
-## Ingest and Merge Intensity Effect on Increment Size
+### Scenario 20: Automatic incremental backup chains with `watch`
+<a id="scenario-20"></a>
 
-**Objective:** Verify (and document) that increment size depends on both ingest batching and background-merge
-intensity, per the official guidance to use larger INSERT batches and avoid frequent mutations. See
-[Documentation References](#documentation-references).
+**Goal:** Confirm the `watch` command automatically creates a repeating pattern of full and incremental
+backups and cleans up old ones correctly.
 
 **Steps:**
 
-1. `create_remote <full>` over a baseline dataset.
-2. Case A: ingest the same volume of new rows using **large** INSERT batches (few large new parts), merges idle.
-3. Case B: ingest the same volume using **many small** INSERTs and/or trigger heavy merges/mutations.
-4. Create an increment for each case with `--diff-from-remote=<full>` and compare `compressed_size`.
+1. Start `watch` with short intervals (a full backup every so often, incremental backups in between) and a
+   remote-retention limit.
+2. Add data between intervals so each cycle produces a new incremental backup based on the previous one.
+3. After several cycles, restore the latest backup onto an empty table.
 
 **Expected result:**
 
-| Test Assertion | Expected Result |
-| --- | --- |
-| Batch effect | Case A (large batches, idle merges) produces a smaller increment than Case B for the same logical data volume |
-| Correctness | Both cases restore to the same logical data as the source |
-| Documented behavior | Results are consistent with the documented dependency of increment size on ingest and merge intensity |
+| Check | Expected |
+| ----- | -------- |
+| Chain built | Incremental backups are created based on the previous backup; full backups appear on schedule |
+| Cleanup | Old backups that are no longer needed are removed, but backups still needed by a chain are kept |
+| Data after restore | The latest backup restores correctly |
+
+### Scenario 21: How insert size and merges affect incremental backup size
+<a id="scenario-21"></a>
+
+**Goal:** Confirm and document that the size of an incremental backup depends not only on how much data was
+added, but also on how it was inserted and on background merges — inserting the same data in a few large
+inserts (with merges quiet) produces a smaller incremental backup than many tiny inserts or heavy merges.
+
+**Steps:**
+
+1. Make a full backup of a baseline table.
+2. Case A: add a fixed amount of new data using a few large inserts, with merges quiet.
+3. Case B: add the same amount of data using many small inserts and/or by triggering merges.
+4. Make an incremental backup for each case and compare their sizes.
+
+**Expected result:**
+
+| Check | Expected |
+| ----- | -------- |
+| Size difference | Case A produces a smaller incremental backup than Case B for the same amount of new data |
+| Data after restore | Both cases restore to the same correct data |
