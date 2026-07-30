@@ -84,7 +84,6 @@ The official description of this behavior is in the clickhouse-backup documentat
 [References](#references)).
 
 ### Which Part Types Are Supported
-<a id="which-part-types-are-supported"></a>
 
 `clickhouse-backup` copies a part by simply taking the files that make up that part (using
 `ALTER TABLE ... FREEZE`). It decides whether to reuse a part or upload it again based only on the part's
@@ -145,7 +144,7 @@ still backed up, just not incrementally). Tables whose data lives in an external
 > supported.
 
 ### Which ClickHouse Versions Are Supported
-<a id="which-clickhouse-versions-are-supported"></a>
+
 **Short answer:** on every ClickHouse version in the Testflows matrix tests
 (`22.3` … `26.3 (latest currently)`), **regular part-level incremental backups are supported** (`--diff-from` /
 `--diff-from-remote`). There is no Testflows version where regular incremental is “not supported”.
@@ -198,3 +197,50 @@ Constraints within the Testflows matrix:
 * Patch parts: `25.8`+.
 
 Default image when `CLICKHOUSE_VERSION` is unset: **26.3** (specified in `test/testflows/run.sh`).
+
+### Backward Compatibility Across ClickHouse Versions
+
+A common real-world case is a chain that runs for a long time (for example a year) while the ClickHouse server is
+upgraded underneath it: the **full/base backup was created on an older version X**, and later **incremental
+backups are created on a newer version Y**. Two questions follow from that, and both are answered by how
+`clickhouse-backup` decides to reuse a part.
+
+**How reuse is decided by clickhouse-backup** 
+
+When building an increment, `clickhouse-backup` matches each
+current part against the base backup by the part's **name** and a **content fingerprint** of its files —
+`hash_of_all_files` when available, otherwise a CRC64 checksum of `checksums.txt` (see `pkg/backup/upload.go`
+`markDuplicatedParts`, `pkg/filesystemhelper/filesystemhelper.go` `addRequiredPartIfNotExists`). It **never
+compares the ClickHouse version** that created a backup. Each backup does record the server version that
+made it (the `clickhouse_version` field in `backup_name/metadata.json`), but that value is informational only —
+nothing in the create, upload, download, or restore path reads it back to gate reuse or restore.
+
+**Q1 — Base created on version X, increments created on version Y (X older, Y newer): is that supported?**
+
+**Yes**, from `clickhouse-backup`'s side. Because reuse is decided purely by part name + fingerprint:
+
+* A data part that ClickHouse has **not** rewritten since the upgrade keeps the same name and the same file
+  contents, so its fingerprint still matches the base and it is **reused** (not uploaded again).
+* A part that ClickHouse **did** rewrite after the upgrade — through a background merge, a mutation, or because
+  the on-disk part was rebuilt — gets a **new name** (or a changed fingerprint) and is therefore **uploaded as
+  new data**, which is the correct behavior. This is the same rule that applies within a single version.
+* Restore/download walks the chain and reassembles parts regardless of which version created each one.
+
+This relies on one ClickHouse property that this plan treats as an assumption to verify rather than a
+guarantee. ClickHouse data parts are **immutable**, so a version upgrade does not rewrite existing parts in
+place — they change only when a merge or mutation runs.
+
+> Caveat (not relevant to modern upgrades): reuse only deduplicates when both sides expose the **same kind of
+> fingerprint**. A backup made on ClickHouse **< 19.11** stores only the legacy CRC64 checksum, while **≥ 19.11**
+> stores `hash_of_all_files` and does not compute the CRC64. If a chain straddles the 19.11 boundary, a
+> name-matched part fails the fingerprint check and is re-uploaded — the restore is still correct, it just
+> stops saving space. Any realistic multi-year upgrade (for example 24.x → 25.x) stays above 19.11, so
+> both sides use `hash_of_all_files` and dedup works normally.
+
+**Q2 — In one chain, are all parts created by the same ClickHouse version, or can they differ?**
+They can differ. There is no requirement that every part in a chain comes from the same ClickHouse version.
+Each part is stored or reused independently by name + fingerprint, and each backup in the chain records its own
+`clickhouse_version`. A chain that spans an upgrade will legitimately contain parts created by version X (the
+untouched parts carried forward from the base) alongside parts created by version Y (the new/rewritten parts in
+later increments). The chain itself is only a linear list of `required_backup` links. It carries no
+single ClickHouse-version constraint.
