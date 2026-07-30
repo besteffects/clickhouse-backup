@@ -143,3 +143,58 @@ still backed up, just not incrementally). Tables whose data lives in an external
 > **Recommendation:** apply pending updates before backing up — run `ALTER TABLE ... APPLY PATCHES` (or let
 > background merges finish) so the changes are written into normal Wide/Compact parts, which are fully
 > supported.
+
+### Which ClickHouse Versions Are Supported
+<a id="which-clickhouse-versions-are-supported"></a>
+**Short answer:** on every ClickHouse version in the Testflows matrix tests
+(`22.3` … `26.3 (latest currently)`), **regular part-level incremental backups are supported** (`--diff-from` /
+`--diff-from-remote`). There is no Testflows version where regular incremental is “not supported”.
+
+`clickhouse-backup` itself supports ClickHouse **above 1.1.54394**
+([ReadMe — Limitations](https://github.com/Altinity/clickhouse-backup/blob/master/ReadMe.md#limitations)).
+Regular incremental works on that whole range for MergeTree-family tables. What changes by version is only
+*how* freeze/fingerprint/cleanup work, and whether the **embedded** incremental path is available.
+
+**Is incremental supported?**
+
+| Backup mode | Incremental supported? | From ClickHouse version | Notes |
+| ----------- | ---------------------- | ----------------------- | ----- |
+| **Regular** (`--diff-from`, `--diff-from-remote`) | **Yes** | above 1.1.54394 (same as the tool) | Default path for this plan; MergeTree-family only |
+| **Embedded** (`use_embedded_backup_restore: true` + `base_backup`) | **Yes** | **22.7+** documented; **22.8+** in Testflows | Needs `clickhouse-backup` 2.5.3+; skip on Testflows `22.3` |
+| Below tool minimum (≤ 1.1.54394) | **No** | — | Outside `clickhouse-backup` support |
+
+> [!NOTE]
+For Testflows, run embedded incremental on **22.8+** only.
+
+**Related version notes.** For Testflows (`22.3`+), the old
+implementation floors below are already satisfied on every cell, so they do **not** need their own table rows for deciding what to run:
+
+* `hash_of_all_files` fingerprint — 19.11+ (`pkg/backup/create.go`; older CH used CRC64 of `checksums.txt`)
+* hard-linked freeze out of `shadow` — 21.4+ (`pkg/filesystemhelper`)
+* `ALTER TABLE ... UNFREEZE` after backup — above 21.4 (`pkg/backup/create.go`)
+
+What *does* still gate scenarios in this plan:
+
+* **Patch parts** (lightweight `UPDATE`, 25.8+) — incremental still works, but pending patches are
+  unreliable; materialize with `APPLY PATCHES` first.
+* **Object disks** — S3 21.8+, GCS from S3 22.6+, Azure Blob 23.3+.
+
+In embedded mode ClickHouse computes the file-level diff itself and the base backup is passed at create time, so
+`--diff-from` (local base) is regular-mode only.
+
+**What to run for this test plan (Testflows).** Automated coverage is Testflows from **22.3**, specifically versions:
+
+`22.3`, `22.8`, `23.3`, `23.8`, `24.3`, `24.8`, `25.3`, `25.8`, `26.3`
+
+On **all** of these: regular incremental are **supported**.
+
+For this plan, use the Testflows matrix and the tables above.
+
+Constraints within the Testflows matrix:
+
+* Regular incremental scenarios: run on **all** matrix versions (`22.3`+).
+* Embedded incremental: **skip** `22.3`; run on `22.8`+.
+* Object disks: S3 from `22.3`; GCS/Azure needs later versions (22.8+ / 23.3+).
+* Patch parts: `25.8`+.
+
+Default image when `CLICKHOUSE_VERSION` is unset: **26.3** (specified in `test/testflows/run.sh`).
