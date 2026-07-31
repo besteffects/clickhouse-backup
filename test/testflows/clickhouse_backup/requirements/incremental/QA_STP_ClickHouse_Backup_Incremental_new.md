@@ -211,9 +211,12 @@ When building an increment, `clickhouse-backup` matches each
 current part against the base backup by the part's **name** and a **content fingerprint** of its files —
 `hash_of_all_files` when available, otherwise a CRC64 checksum of `checksums.txt` (see `pkg/backup/upload.go`
 `markDuplicatedParts`, `pkg/filesystemhelper/filesystemhelper.go` `addRequiredPartIfNotExists`). It **never
-compares the ClickHouse version** that created a backup. Each backup does record the server version that
-made it (the `clickhouse_version` field in `backup_name/metadata.json`), but that value is informational only —
-nothing in the create, upload, download, or restore path reads it back to gate reuse or restore.
+compares the ClickHouse version** that created a backup. Separately, each backup’s top-level
+`backup_name/metadata.json` stores one server-wide field `clickhouse_version` — the
+`VERSION_DESCRIBE` of the ClickHouse that ran that create (`BackupMetadata.ClickHouseVersion` in
+`pkg/metadata/backup_metadata.go`, set in `pkg/backup/create.go`). It is **not** recorded per part. The
+field is informational only: nothing in create, upload, download, or restore reads it back to gate reuse or
+restore.
 
 **Q1 — Base created on version X, increments created on version Y (X older, Y newer): is that supported?**
 
@@ -239,8 +242,8 @@ place — they change only when a merge or mutation runs.
 
 **Q2 — In one chain, are all parts created by the same ClickHouse version, or can they differ?**
 They can differ. There is no requirement that every part in a chain comes from the same ClickHouse version.
-Each part is stored or reused independently by name + fingerprint, and each backup in the chain records its own
-`clickhouse_version`. A chain that spans an upgrade will legitimately contain parts created by version X (the
-untouched parts carried forward from the base) alongside parts created by version Y (the new/rewritten parts in
-later increments). The chain itself is only a linear list of `required_backup` links. It carries no
-single ClickHouse-version constraint.
+Parts are not tagged with a version; reuse is only by name + fingerprint. What *is* recorded is one
+`clickhouse_version` **per backup** (in that backup’s `metadata.json`), so after an upgrade the base may show
+X and a later increment Y. A chain that spans an upgrade will still contain parts that first appeared under X
+(reused from the base) alongside parts first uploaded under Y. The chain itself is only a linear list of
+`required_backup` links and carries no single-version constraint.
