@@ -214,7 +214,7 @@ current part against the base backup by the part's **name** and a **content fing
 compares the ClickHouse version** that created a backup. Separately, each backup’s top-level
 `backup_name/metadata.json` stores one server-wide field `clickhouse_version` — the
 `VERSION_DESCRIBE` of the ClickHouse that ran that create (`BackupMetadata.ClickHouseVersion` in
-`pkg/metadata/backup_metadata.go`, set in `pkg/backup/create.go`). It is **not** recorded per part. The
+`pkg/metadata/backup_metadata.go`, set by `pkg/backup/create.go`). It is **not** recorded per part. The
 field is informational only: nothing in create, upload, download, or restore reads it back to gate reuse or
 restore.
 
@@ -247,3 +247,128 @@ Parts are not tagged with a version; reuse is only by name + fingerprint. What *
 X and a later increment Y. A chain that spans an upgrade will still contain parts that first appeared under X
 (reused from the base) alongside parts first uploaded under Y. The chain itself is only a linear list of
 `required_backup` links and carries no single-version constraint.
+
+### Restoring Into Empty vs. Non-Empty Tables
+
+Restoring an incremental backup is not limited to an empty table, and the target table/database may already
+exist. The important question — *does it delete the existing table first or attach on top of it?* — has a
+different answer depending on **which restore mode** is used, because the schema and data steps are controlled independently.
+
+**It is identical when restoring full or incremental backup.** An incremental backup is only "incremental" in its *data*. 
+Every backup, full or incremental, stores the complete
+table schema (the `CREATE` statement) in its own per-table metadata (`Query` in
+`backup_name/metadata/<db>/<table>.json`, refer to `pkg/metadata/table_metadata.go`). When you restore an increment,
+`clickhouse-backup` reads **that increment's own metadata**, so the schema is self-contained and the base
+backup is not needed to (re)create the table. The only part of restore that walks the chain is the *data* step,
+which resolves the parts marked `required` from the base backups (`pkg/backup/download.go` recursive
+`Download` of `RequiredBackup`; `prepareRequiredPartsForRestore`). Concretely, restoring an increment does the
+same schema drop/recreate as restoring a full backup, then attaches its own new parts plus the `required` parts
+pulled from the chain.
+
+**Default restore parameters.** The three flags that decide the behavior all default to **false**, and this is
+identical for full and incremental backups (`cmd/clickhouse-backup/main.go`, `restore` command — *"Create
+schema and restore data from backup"*):
+
+| Flag | Default | Meaning at the default |
+| ---- | ------- | ---------------------- |
+| `-s`, `--schema` (schema-only) | `false` | not schema-only → the **data** step also runs |
+| `-d`, `--data` (data-only) | `false` | not data-only → the **schema** step also runs |
+| `--rm`, `--drop` (force drop) | `false` | drop is not *forced by this flag*… |
+
+Because both `--schema` and `--data` default to false, a bare `clickhouse-backup restore <backup>` runs
+**schema *and* data**. Also because the schema step runs, `RestoreSchema` calls `dropExistsTables`
+**unconditionally** — so by default  the table is **dropped and recreated**. You do **not** need `--rm` to
+get a clean, non-duplicating restore; `--rm`/`--drop` only matters when you also pass `--data` (it forces a drop
+on the otherwise-additive data-only path). The only way to *skip* the drop is to explicitly ask for data-only
+with `--data` parameter. All of this applies **unchanged** to an incremental backup. The flags mean exactly what they mean
+for a full backup.
+
+**How schema restore treats an existing table.** 
+
+Whenever `clickhouse-backup` restores *schema* (for either a
+full or an incremental backup), it first **drops the existing object** and recreates it: `RestoreSchema` calls
+`dropExistsTables` unconditionally, which issues `DROP TABLE IF EXISTS` (or `DETACH` when
+`--restore-schema-as-attach` is used) before the `CREATE` (`pkg/backup/restore.go` `RestoreSchema` →
+`dropExistsTables`; `pkg/clickhouse/clickhouse.go` `DropOrDetachTable`). So schema restore is destructive by
+design — it deletes and re-creates. It does not merge into the existing definition.
+
+**How data restore treats existing data.** 
+
+Data restore copies the backup's parts (including the `required`
+parts collected from the rest of the chain) into the table's `detached/` directory and runs
+`ALTER TABLE ... ATTACH PART` for each one; this step **never** truncates and is purely **additive**.
+Incremental restore uses the **same** attach step as a full restore.
+
+Putting the two together gives the actual behavior per restore mode (this is the answer for non-empty targets):
+
+| Restore mode | Schema step runs? | Existing table deleted first? | Data outcome on a populated target |
+| ------------ | ----------------- | ----------------------------- | ---------------------------------- |
+| `restore` (default: schema **and** data) | Yes | **Yes — `DROP TABLE IF EXISTS` then recreate** | Table is emptied by the drop, then parts attached → faithful copy, **no duplication** |
+| `restore --schema` | Yes | **Yes** | Schema replaced; no data restored |
+| `restore --data` (data-only) | **No** | **No** | Parts attached **on top of** existing rows → overlapping data becomes **duplicated rows** |
+| `restore --data --partitions=...` | No | Per-partition: `DROP PARTITION` for the targeted partitions | Targeted partitions **replaced** cleanly; other partitions left untouched (`dropExistPartitions`, [#756](https://github.com/Altinity/clickhouse-backup/issues/756)) |
+| `restore --rm` / `--drop` | Yes | **Yes (explicit)** | Same as default; also forces the drop when combined with `--data` |
+| Embedded (`use_embedded_backup_restore: true`) | depends on flags as above | schema step drops; data step uses native `RESTORE ... SETTINGS allow_non_empty_tables=1` for `--data` | `allow_non_empty_tables=1` lets ClickHouse restore into a non-empty table; the additive caveat applies to this command |
+
+So the short answer: a **default full restore deletes the existing table first and recreates it** (no
+duplication); a **data-only (`--data`) restore does not delete anything and attaches on top**, which is the one
+mode where a non-empty target can produce wrong data. A safety check can additionally abort a schema-dropping
+restore and require `--rm`/`--drop` when the target tables already contain rows and `restore_schema_on_cluster`
+is configured.
+
+**The three situations spelled out.** To remove any ambiguity, here is exactly what happens to the target in
+each situation, for the two restore modes that matter (a plain `restore`, which restores schema **and** data,
+versus a data-only `restore --data`):
+
+* **1. Target table does not exist, or exists but is empty.** Both modes give a faithful copy. A plain `restore`
+  drops (a no-op when the table is absent or empty) and recreates from the backup schema, then attaches the
+  parts; `restore --data` simply attaches into the empty table. There are no pre-existing rows, so nothing can
+  be duplicated.
+* **2. Target table already contains data.**
+  * *Plain `restore` (schema + data), `--schema`, or `--rm`/`--drop`:* the table is **dropped**
+    (`DROP TABLE IF EXISTS`) and recreated, so the pre-existing rows are **destroyed** and replaced by the
+    backup's data — a faithful copy with no duplication. Be aware this silently discards whatever the target
+    held before.
+  * *`restore --data` (data-only):* the table is **not** dropped; the backup's parts are attached on top, so the
+    pre-existing rows stay and any overlapping data becomes **duplicated rows**.
+  * *`restore --data --partitions=X`:* only partition `X` is dropped and replaced; other partitions are left
+    intact.
+* **3. Target table has a *different schema* than the backup.**
+  * *Plain `restore` / `--schema` / `--rm`:* the existing table is dropped **by name, regardless of its current
+    structure**, and recreated from the backup's `CREATE` statement. The target's different schema **and** its
+    data are gone; you end up with the backup's schema and data. `clickhouse-backup` does **not** compare or
+    merge the two definitions — it replaces, so a differently-defined target table is silently destroyed.
+  * *`restore --data` (data-only):* the schema is **not** touched, so the table keeps its different structure.
+    ClickHouse then validates each backup part against that structure during `ALTER TABLE ... ATTACH PART`. If
+    the structures are **incompatible** (differing columns, types, sorting/partition key), ClickHouse rejects
+    the attach and the **restore fails with an error**; if they happen to be **compatible**, the parts attach
+    (subject to the duplication caveat above). `clickhouse-backup` does not reconcile the schema difference in
+    this mode — it relies on ClickHouse's part-vs-table validation.
+  * *A `PARTITION BY` mismatch is a specific, important case of the above.* Every data part carries a
+    `partition_id` that ClickHouse **computes from the table's partition expression** at the time the part was
+    written, and it is stored with the part (the part directory is named `<partition_id>_<min>_<max>_<level>`).
+    On `ATTACH PART`, ClickHouse re-derives the `partition_id` from the **target table's** current `PARTITION BY`
+    and requires it to match the part being attached. So a data-only restore of parts produced under the
+    backup's `PARTITION BY` into a table defined with a **different** `PARTITION BY` is rejected — the attach
+    fails and the restore errors out; `clickhouse-backup` does not (and cannot safely) re-partition the data. In
+    every other restore mode this cannot happen, because the schema step recreates the table from the backup's
+    own `CREATE`, so the partition expression always matches.
+
+**Where this can cause incorrect data (but not corruption).** The risk exists **only on the `--data`
+(data-only) path**, and it is always *logical* — extra or double-counted rows — never damaged part files:
+
+* **Duplicated rows** on plain `MergeTree` when `--data` attaches parts over overlapping existing rows.
+  ClickHouse assigns fresh block numbers to attached detached parts, so nothing is overwritten and no error is
+  raised; `clickhouse-backup` does not detect or warn about the resulting duplicates.
+* **Misleading results on deduplicating/aggregating engines.** `ReplacingMergeTree`, `SummingMergeTree`, and
+  `AggregatingMergeTree` only collapse or sum duplicates during background merges. Right after an additive
+  `--data` restore the table can show doubled counts or sums until a merge (or a `FINAL` query) runs, so a
+  row-count check taken too early can both hide a real problem or flag a non-problem.
+* **Partial-partition surprises.** Restoring an increment scoped with `--partitions` onto a table that has
+  other partitions replaces only the named partitions; the rest of the table is intentionally left as-is. That
+  is correct behavior but must be accounted for when comparing against a full-table expectation.
+
+The safe rules of thumb, which the scenarios below encode: a plain `restore` (or `--rm`) gives a faithful copy
+because it drops and recreates the table; use `--data --partitions=...` to **replace** specific partitions; and
+only use a bare `--data` restore onto a populated table when you deliberately want to merge datasets and can
+tolerate (or later deduplicate) overlaps.
