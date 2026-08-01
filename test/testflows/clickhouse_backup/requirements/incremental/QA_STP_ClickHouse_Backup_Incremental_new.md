@@ -372,3 +372,39 @@ The safe rules of thumb, which the scenarios below encode: a plain `restore` (or
 because it drops and recreates the table; use `--data --partitions=...` to **replace** specific partitions; and
 only use a bare `--data` restore onto a populated table when you deliberately want to merge datasets and can
 tolerate (or later deduplicate) overlaps.
+
+
+### Incremental Restore in a Multi-Replica Setup
+
+`clickhouse-backup` is a **per-node** tool: each invocation talks to one ClickHouse server and only reads/writes
+that node's local data. It does **not** do a restore out to every replica by itself. In a cluster of
+`Replicated*` tables the missing piece is filled by ClickHouse's own replication: parts attached on one
+replica are propagated to the other replicas of the same shard through Keeper/ZooKeeper. This is also true for full
+backups and, in exactly the same way, for **incremental** backups — the incremental nature only affects which
+parts get attached on the one node that runs the data restore, not how they spread to the sibling nodes.
+
+**Do we restore on one replica or all of them? Split the answer into schema and data.** The recommended and
+tested pattern (see the Kubernetes restore `Job` and the sharded-cluster recipe in `Examples.md`) restores
+**schema on every replica** but **data on only the first replica of each shard**:
+
+| Restore step | Where to run it | Why |
+| ------------ | --------------- | --- |
+| **Schema** (`restore_remote --schema --rm`) | **Every replica** in each shard (or once with `restore_schema_on_cluster` / `ON CLUSTER`) | Each replica must have its own local table definition and must register its own replica entry in Keeper before it can receive data |
+| **Data** (`restore_remote --data`) | **Only the first replica** of each shard | The attached parts replicate automatically to the other replicas; running `--data` on more than one replica of the same shard attaches the same parts twice and **duplicates rows** |
+
+**Important: the "data on only the first replica" rule applies *only* to the `Replicated*` engines family.**
+It is a direct consequence of ClickHouse replication that copies parts between replicas. Plain (non-replicated) `MergeTree`-family tables has no such mechanism. The distinction is fundamental to how
+data restore must be run across nodes:
+
+| Engine family | Is data auto-propagated between nodes? | Where to run the `--data` step | Duplication risk |
+| ------------- | -------------------------------------- | ------------------------------ | ---------------- |
+| **`Replicated*MergeTree`** (`ReplicatedMergeTree`, `ReplicatedReplacingMergeTree`, …) | **Yes** — via Keeper/ZooKeeper | **Only the first replica** of each shard; siblings receive the data through replication | Running `--data` on more than one replica of a shard **duplicates rows** |
+| **Plain `MergeTree` family** (`MergeTree`, `ReplacingMergeTree`, `SummingMergeTree`, `AggregatingMergeTree` and so on, *without* the `Replicated` prefix) | **No** — each node is an independent local table | **Every node** that must hold the data (there are no "replicas" to propagate to) | No cross-node duplication from replication (nothing propagates).|
+
+So for a plain `MergeTree` table there is no such thing as "restore on the first replica and let it spread". It won't be copied. If two nodes each carry a plain `MergeTree` table of the same name, they are **independent**
+tables; restoring data on node A leaves node B empty. To end up with the same data on several nodes you must run
+the **data** restore on **each** of them (and each node needs the backup. For an increment, the full
+chain is available locally). In practice a plain `MergeTree` in a multi-node cluster is normally used **per
+shard behind a `Distributed` table** (each node holds a *different* slice of the data). So you back up and
+restore each node independently rather than relying on any propagation. The schema step is the same in both
+cases — it always runs on every node.
