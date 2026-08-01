@@ -408,3 +408,30 @@ chain is available locally). In practice a plain `MergeTree` in a multi-node clu
 shard behind a `Distributed` table** (each node holds a *different* slice of the data). So you back up and
 restore each node independently rather than relying on any propagation. The schema step is the same in both
 cases — it always runs on every node.
+
+**What is incremental-specific here.** When you run the `--data` step on the first replica, `clickhouse-backup`
+attaches that increment's **own** parts **plus** the `required` parts it pulls from the base backups in the
+chain (`prepareRequiredPartsForRestore`; recursive `Download` of `RequiredBackup`). ClickHouse replication then
+copies the **resulting final parts**. Base-chain parts and increment parts are alike to the sibling replicas.
+The consequence worth testing: **only the one replica that runs `--data` needs access to the full backup chain**
+(and needs the base backups downloaded locally). The other replicas reconstruct the same data purely through
+native replication and never reads the increment or the base backups at all. So an incremental restore in a
+multi-replica cluster is still a **single-node data restore per shard** followed by replication.
+
+**Safety knobs that matter for a multi-replica incremental restore:**
+
+* `check_replicas_before_attach: true` (default) makes a node wait/skip when a sibling is already attaching the
+  same parts, guarding against the accidental double-`--data` duplication described above.
+* `sync_replicated_tables: true` (default) issues `SYSTEM SYNC REPLICA` so a node has caught up before it
+  participates, which matters when the base and the increment were taken at different times.
+* `default_replica_path` / `default_replica_name` and the opt-in `rebind_replica_path_if_exists` resolve
+  Keeper replica-path conflicts when a table with the same path already exists. **`rebind_replica_path_if_exists`
+  must stay `false` during a concurrent multi-replica restore**, otherwise rebinding a path held by a live
+  sibling causes split-brain (ReadMe, [#1428](https://github.com/Altinity/clickhouse-backup/issues/1428)).
+* `--replicated-copy-to-detached` copies parts into `detached/` but **skips** the `ATTACH PART`, which is used
+  when you want replication (or a later manual attach) to bring the data in rather than attaching directly.
+
+**Backup creation on replicated clusters.** The same "first replica per shard" rule applies when *creating* the
+incremental backup: run `create` / `create_remote --diff-from-remote=...` on one replica per shard, so the
+increment is computed once per shard against that shard's base backup. Backing up every replica would produce
+redundant copies of the same replicated data.
