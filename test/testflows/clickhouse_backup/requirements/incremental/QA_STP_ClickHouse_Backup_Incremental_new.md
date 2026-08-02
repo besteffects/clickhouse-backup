@@ -427,7 +427,7 @@ multi-replica cluster is still a **single-node data restore per shard** followed
 * `default_replica_path` / `default_replica_name` and the opt-in `rebind_replica_path_if_exists` resolve
   Keeper replica-path conflicts when a table with the same path already exists. **`rebind_replica_path_if_exists`
   must stay `false` during a concurrent multi-replica restore**, otherwise rebinding a path held by a live
-  sibling causes split-brain (ReadMe, [#1428](https://github.com/Altinity/clickhouse-backup/issues/1428)).
+  sibling causes incorrect restore (see, [#1428](https://github.com/Altinity/clickhouse-backup/issues/1428)).
 * `--replicated-copy-to-detached` copies parts into `detached/` but **skips** the `ATTACH PART`, which is used
   when you want replication (or a later manual attach) to bring the data in rather than attaching directly.
 
@@ -435,3 +435,70 @@ multi-replica cluster is still a **single-node data restore per shard** followed
 incremental backup: run `create` / `create_remote --diff-from-remote=...` on one replica per shard, so the
 increment is computed once per shard against that shard's base backup. Backing up every replica would produce
 redundant copies of the same replicated data.
+
+
+### Concurrent INSERT / ALTER During Backup and Restore
+
+Another question is illustrated by the `partA + partB → partC` merge in the request - is what an incremental
+backup captures when the table keeps changing **while** the backup (or restore) is running. `clickhouse-backup`
+does **not** stop merges or makes a table lock. It relies on ClickHouse's
+part-level atomicity instead. The behavior is the same for full and incremental backups. 
+
+But it is called out here because the *deduplication* outcome (reuse vs. re-upload) is what makes it visible on an increment.
+
+**During backup creation.** `clickhouse-backup` runs `ALTER TABLE ... FREEZE`, which tells ClickHouse to
+hard-link a copy of every **active** part (live data that is already finished — not `tmp_...` in-progress
+parts, not `detached/`). That FREEZE moment is the cutoff: only those parts enter the backup. Concurrent
+work is judged only by whether it finished **before** or **after** that moment:
+
+* **Parallel INSERT.** A part is either *active* at freeze time (fully included) or it is not (fully excluded) —
+  parts are atomic, so there are never half-written parts in a backup. Rows inserted **before** freeze are in
+  the backup; rows inserted **after** are not. For an increment this simply means the just-inserted new parts
+  are uploaded as new data. Unchanged older parts are still reused from the base.
+* **Parallel merge (the `partC` case).** A merge that combines `partA + partB` into `partC` does not lose or
+  change rows — but it produces a **new part with a new name and a new `hash_of_all_files`**. What the increment
+  stores depends on whether that merge finished before the increment's freeze:
+  * *Merge completed before freeze:* the active set is `{partC}`. `partC` is **not** present in the base (the
+    base had `partA`, `partB`), so the increment cannot deduplicate it and **uploads `partC` as new data** —
+    re-storing rows that the base already held inside `partA + partB`. The restore is still correct (`partC`
+    contains all the rows). But the increment is larger than a "pure delta".
+  * *Merge not yet completed at freeze:* the active set is still `{partA, partB}`, both are found in the base by
+    name + fingerprint, so the increment **reuses** them and uploads only changed data.
+  * Either way there is **no data loss or corruption** — only a difference in **how much the increment re-uploads**.
+* **Parallel ALTER.**
+  * *Metadata-only `ALTER`* (TTL, comment, index add) is fast and rewrites no parts. The schema captured for the
+    backup is whatever `SHOW CREATE TABLE` returned when the table list was built.
+  * *Data-rewriting `ALTER` / mutation* (`ALTER ... UPDATE`/`DELETE`, `MODIFY COLUMN` that rewrites) produces
+    **new mutation parts** with new names. They then become the active parts the freeze captures — so the
+    increment re-uploads them as new data. In-progress mutations are recorded once per backup
+    (`GetInProgressMutationsBatch` over `system.mutations`, gated by `backup_mutations`) so a restore can carry
+    pending mutations forward (restore side needs `restore_as_attach`).
+  * *Column-type races are actively guarded.* If a concurrent `ALTER ... MODIFY COLUMN` leaves the active parts
+    with **inconsistent column types** (some parts old type, some new) mid-backup, the default
+    `check_parts_columns: true`  **aborts** backup with *"inconsistent data types for active data part"*
+    (`CheckSystemPartsColumnsForTables`, `pkg/clickhouse/clickhouse.go`) rather than produces a corrupt backup.
+    It is true unless you explicitly pass `--skip-check-parts-columns`.
+  * *CREATE/DROP races* are tolerated: `ignore_not_exists_error_during_freeze: true` (default) ignores
+    ClickHouse error codes 60/81 so frequent CREATE/DROP of tables during a backup does not fail the whole run.
+* **No cross-table instant.** FREEZE is atomic **per table**, so a multi-table backup is a set of per-table
+  snapshots taken at slightly different moments, not one cluster-wide instant. For a single table the snapshot
+  is consistent; across tables.
+
+**During restore.** Restore is **not** designed to run against a table that is being written concurrently. The
+intended pattern is to restore into a inactive target. A default `restore` gives that by dropping and recreating
+the table first.
+
+* *Default `restore` (schema + data)* drops and recreates the table, then attaches parts. A client that writes
+  to the table during the drop/recreate window can see *"table doesn't exist"* or lose those writes when the
+  table is replaced. This is expected and is why restores should run during a maintenance window.
+* *`restore --data`* is additive, so a concurrent `INSERT` blended with `ATTACH PART` produces **duplicated
+  / overlapping rows** (never corruption — block numbers keep parts valid). The same additive caveat as a
+  non-empty target.
+* *Replicated tables* rely on `check_replicas_before_attach: true` to avoid two nodes attaching the same parts
+  at once, and `restore_as_attach: true` to restore tables that have in-progress mutations or an inconsistent
+  part structure.
+
+The practical rule the scenarios encode: incremental **backup** creation is safe to run against a live,
+writing table (FREEZE gives a consistent per-table snapshot; concurrent merges only affect dedup efficiency,
+and a racing column-type ALTER aborts the backup rather than corrupting it), but **restore** should target a
+locked table.
