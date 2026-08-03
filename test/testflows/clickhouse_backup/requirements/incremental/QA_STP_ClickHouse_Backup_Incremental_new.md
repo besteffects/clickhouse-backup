@@ -648,6 +648,7 @@ The tests use the standard TestFlows environment for `clickhouse-backup`, which 
 * Two ClickHouse nodes, `clickhouse1` and `clickhouse2`, and a ZooKeeper node for coordination.
 * A `clickhouse_backup` container running the `clickhouse-backup` binary under test.
 * Remote storage backends available in the environment (for example MinIO for S3, plus FTP and SFTP servers).
+* Extra nodes may be added if decided so later.
 
 **ClickHouse versions under test.** Run the plan against the versions listed in
 [Which ClickHouse Versions Are Supported](#which-clickhouse-versions-are-supported). The Testflows CI matrix is
