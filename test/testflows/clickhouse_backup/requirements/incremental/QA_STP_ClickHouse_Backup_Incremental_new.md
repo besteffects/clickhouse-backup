@@ -546,3 +546,66 @@ chains than for regular ones.
 * **Rebase first** `clickhouse-backup` `rebase`, to make a chosen backup
   **self-contained** — it then carries all its parts and no longer has a `required_backup`.So that single
   backup can be copied to the new storage and restored on its own.
+
+  ## Testing Approach
+
+Each test follows the same simple idea:
+
+1. Put a table into a known state and make a full backup (call it the **base state**).
+2. Change the data in a controlled way and make an incremental backup (**state 1**, **state 2**, and so on for
+   longer chains).
+3. Restore the latest backup onto an empty table (or a clean node) and check the result.
+
+Unless a scenario says otherwise, restore is done onto an empty target (or a clean node) so the restored data
+can be compared directly against the source. Note that a plain `restore` also **drops and recreates** an
+existing table before restoring, so it is faithful even against a populated target. Restoring into a table that
+already has data becomes a concern only with a data-only (`--data`) restore.
+
+For every test we confirm two things:
+
+* **The data is correct** — after restore, the table contains exactly the same rows as the original. "Exactly
+  the same" is defined precisely below in [Measuring Data Equivalence](#measuring-data-equivalence). Wherever a
+  scenario says "compare rows / counts against the source", it means that check.
+* **Only the changes were stored** — the incremental backup is much smaller than a full backup would be. This
+  is visible from the reported backup size (for example in `clickhouse-backup list`). This matters because a
+  broken incremental backup that secretly copied everything would still restore correctly, so a data check
+  alone is not enough to prove the feature works.
+
+### Measuring Data Equivalence
+
+Restore correctness is measured using two checks that must both
+match between the source table and the restored table:
+
+1. **Row count** — `SELECT count() FROM t`.
+2. **Order-independent hash/count over all columns** —
+   `SELECT sum(cityHash64(*)) AS h, count() AS c FROM t`.
+   `cityHash64(*)` hashes **all columns** of each row.
+   
+    `sum(...)` is commutative, so the result does not depend
+   on row or part order. Both `h` and `c` must be equal on source and target.
+
+**Exact (deterministic) alternative for small tables.** When an ordered, row-by-row comparison is wanted,
+we can select every column ordered by a full key and compare position by position:
+`SELECT * FROM t ORDER BY <all columns that make the row unique>`. This is what the project's integration tests do — `checkData` in `test/integration/utils.go` runs `SELECT * ... ORDER BY <orderBy>` and
+asserts every column of every row plus the total row count. It is precise but memory-heavy, so it is best for
+small fixtures; the aggregate fingerprint above is the scalable default for large tables.
+
+**Conditions to control before comparing:**
+
+* **Schema/column order must match.** `cityHash64(*)` depends on column order and types. A default `restore`
+  recreates the table from the backup's `CREATE`, so this is guaranteed; if you compare against an
+  independently-defined table, align the column list explicitly.
+* **Deduplicating / aggregating engines.** On `ReplacingMergeTree`, `SummingMergeTree`, and
+  `AggregatingMergeTree` the visible rows depend on background merges, so take the fingerprint with `FINAL`
+  (`SELECT sum(cityHash64(*)) FROM t FINAL`) or after `OPTIMIZE TABLE t FINAL`, on **both** sides.
+* **`AggregateFunction` state columns** are compared via `finalizeAggregation(col)` (or after `FINAL`) rather
+  than hashing the raw state bytes, which are not guaranteed to be byte-identical.
+* **Floats / `DateTime` / `Nullable` / `LowCardinality`** hash by value and compare correctly. No special
+  handling is needed beyond the engine and schema limitations above.
+
+**A note on background merges.** ClickHouse merges parts in the background, which renames and rewrites them.
+This can change which parts count as "new" between two backups and is the main cause of unstable test results.
+Tests that need parts to stay stable stop merges (`SYSTEM STOP MERGES`) or insert into separate partitions so
+the changed parts are predictable. One test has to be done to deliberately run *with* merges to check behavior under that
+condition.
+
