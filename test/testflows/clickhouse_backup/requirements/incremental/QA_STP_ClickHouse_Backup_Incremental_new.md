@@ -76,10 +76,11 @@ The goal of this plan is to confirm that:
 ## How Incremental Backups Work in clickhouse-backup
 
 ClickHouse stores table data in immutable files on disk called **data parts**. A part is written once and is
-never modified in place. When data changes, ClickHouse writes new parts and eventually merges old ones into
-new ones.
+never modified in place. When data changes, ClickHouse writes new parts. Later, background merges may replace
+several existing parts with one newly written part that holds their combined data, and the old parts are then
+dropped.
 
-`clickhouse-backup` utility uses this to make incremental backups: when it creates an incremental backup, it compares
+`clickhouse-backup` utility uses this to make incremental backups. When it creates an incremental backup, it compares
 the current parts against the parts already saved in the base backup. Parts that already exist in the base
 backup are **reused** (their data is not uploaded again). Only genuinely new parts are uploaded.
 
