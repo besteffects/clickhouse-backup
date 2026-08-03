@@ -659,3 +659,54 @@ Most single-node scenarios run on `clickhouse1`. Scenarios that need more than o
 sharded-cluster scenario) use both `clickhouse1` and `clickhouse2` via the predefined `sharded_cluster`
 configuration. To confirm a restore is complete, tests drop the table (or use a clean node) and restore into an empty target.
 
+## References
+
+The following stable sources describe the behavior tested here:
+
+* clickhouse-backup project and documentation: <https://github.com/Altinity/clickhouse-backup>
+* How incremental backups work with remote storage:
+  <https://github.com/Altinity/clickhouse-backup/blob/master/Examples.md#how-incremental-backups-work-with-remote-storage>
+* Supported ClickHouse versions (Limitations) and embedded mode (22.7+):
+  <https://github.com/Altinity/clickhouse-backup/blob/master/ReadMe.md#limitations>
+* Commands and options (`create`, `create_remote`, `upload`, `restore`, `rebase`, `watch`, `--diff-from`,
+  `--diff-from-remote`, `--partitions`): <https://github.com/Altinity/clickhouse-backup/blob/master/Manual.md>
+* Changelog (embedded BACKUP/RESTORE 22.7+, hard-linked freeze 21.3+):
+  <https://github.com/Altinity/clickhouse-backup/blob/master/ChangeLog.md>
+* ClickHouse version matrix used by CI: `.github/workflows/build.yaml` (Testflows and integration jobs)
+
+## Human Resources And Assignments
+
+The following team members SHALL be dedicated to this effort:
+
+* Vitalii Sviderskyi (regression tests)
+* Vitaliy Zakaznikov (manager, regression tests)
+* Eugene Klimov (clickhouse-backup development)
+
+## Release Notes
+
+* https://github.com/Altinity/clickhouse-backup/blob/master/ChangeLog.md
+* https://github.com/Altinity/clickhouse-backup/blob/master/Examples.md
+
+---
+
+## Test Scenarios
+
+### Scenario 1: Create and restore a single incremental backup
+
+**Goal:** Confirm the basic flow works — a full backup, then one incremental backup, then a correct restore.
+
+**Steps:**
+
+1. Create a partitioned `MergeTree` table on a single node cluster and insert a first batch of data.
+2. Make a full remote backup: `create_remote base_backup`.
+3. Insert a second batch of data into a new partition.
+4. Make an incremental backup: `create_remote --diff-from-remote=base_backup inc_backup`.
+5. Drop the table and restore the incremental backup: `restore_remote inc_backup`.
+
+**Expected result:**
+
+| What is checked | Expected |
+| ----- | -------- |
+| Data after restore | The table contains both batches of data, identical to before the drop |
+| Backup size | `inc_backup` is much smaller than `base_backup` (only the new data was stored) |
+
