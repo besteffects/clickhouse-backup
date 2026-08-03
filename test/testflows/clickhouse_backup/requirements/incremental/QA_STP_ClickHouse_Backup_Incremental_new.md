@@ -502,3 +502,47 @@ The practical rule the scenarios encode: incremental **backup** creation is safe
 writing table (FREEZE gives a consistent per-table snapshot; concurrent merges only affect dedup efficiency,
 and a racing column-type ALTER aborts the backup rather than corrupting it), but **restore** should target a
 locked table.
+
+
+### Backup Storage Location and Chain Portability
+
+An incremental backup depends on its base, so a question is *where* that dependency is resolved. Should
+the whole chain live in one place, and what breaks if you change the storage type or the folder? The design is simple.
+
+**How the dependency is recorded — by name only.** When an increment is uploaded with `--diff-from-remote=<base>`,
+`clickhouse-backup` stores the base **name** in the increment's `metadata.json` as `required_backup: <base>`
+(`pkg/backup/upload.go`; `backupMetadata.RequiredBackup = diffFromRemote`). It stores **no** endpoint, no
+storage type, no bucket, and no path — just the name. On restore/download the tool resolves that name
+**recursively in the currently configured remote storage** (`pkg/backup/download.go` recursive `Download` of
+`remoteBackup.RequiredBackup` → `ReadBackupMetadataRemote`). If the name is not found there it aborts with
+`'<name>' is not found on remote storage`.
+
+**Consequence: the entire chain must live in one remote storage, under one path.** Because resolution is
+name-based against the single configured remote, the base and **every** increment in the chain must be
+co-located in the **same** `remote_storage` (same type), the **same** bucket/host, and the **same** `path`
+prefix. You **cannot** split a chain. For example keep the base in one bucket and push increments to another is not a good approach
+because both the increment *upload* (which reads the base via `getTablesDiffFromRemote`) and the later
+*download* read only from the one configured remote.
+
+**What happens when you change the storage type or folder:**
+
+| Change you make | Effect on the chain | What to do |
+| --------------- | ------------------- | ---------- |
+| Point config at a **different / empty** storage, or a different `remote_storage` **type** | Increments can't find their base by name → download/restore fails with `'<base>' is not found on remote storage` | Migrate the whole chain first (below), or start a new full backup there |
+| Change **`path`** (folder prefix) within the same bucket/host | Old backups still live under the **old** prefix and are invisible under the new one → same "not found" | Move/copy the whole chain to the new prefix, or start a fresh full backup under it |
+| Change bucket/host/type **and copy the entire chain** preserving names and layout | **Works** — resolution is by name + directory layout, not by endpoint | Copy **all** backups of the chain (same names, same structure, **including `object_disk_path` data** for object-disk backups) |
+| Keep base in storage A, write increments to storage B | **Not supported** — one remote per operation | Use **one storage per chain** |
+
+**Object-disk backups need their data moved too.** For tables on object disks, the part data is stored under
+the storage's `object_disk_path` (separate from the metadata `path`). Migrating a chain of object-disk backups
+means copying **both** the backup `path` tree **and** the referenced `object_disk_path` data, and a restore into
+a different account/bucket may require object-disk key rewriting — so a storage move is heavier for object-disk
+chains than for regular ones.
+
+**Safer ways to change storage.** Two tool-supported patterns avoid a fragile chain move:
+
+* **Start a new full backup in the new location** and begin a fresh chain there. The old chain stays intact in
+  the old storage for as long as you keep it for restore.
+* **Rebase first** `clickhouse-backup` `rebase`, to make a chosen backup
+  **self-contained** — it then carries all its parts and no longer has a `required_backup`.So that single
+  backup can be copied to the new storage and restored on its own.
