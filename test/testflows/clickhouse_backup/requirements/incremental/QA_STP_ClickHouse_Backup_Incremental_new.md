@@ -609,3 +609,52 @@ Tests that need parts to stay stable stop merges (`SYSTEM STOP MERGES`) or inser
 the changed parts are predictable. One test has to be done to deliberately run *with* merges to check behavior under that
 condition.
 
+## Scope and Relationship to Existing Tests
+
+The internal mechanics of incremental backups (how parts are marked as reused, checksums, object-disk copying,
+rebase internals) are already exercised by the Go integration tests under `test/integration/`. Integration tests run
+against a single ClickHouse node and inspect backup metadata directly.
+
+This plan focuses on **end-to-end, user-visible behavior** and on **multi-node scenarios** that the
+single-node integration tests cannot cover. If a scenario overlaps with existing integration coverage, this should be noted so the same thing is not tested twice for no reason.
+
+## Timeline
+
+The testing of `clickhouse-backup` incremental backups SHALL be started on July 20, 2026.
+
+## Commands and Options Used
+
+Incremental backups are selected with one of two options that name the base backup:
+
+| Option | Where the base backup lives | Commands that accept it |
+| ------ | --------------------------- | ----------------------- |
+| `--diff-from-remote=<name>` | On remote storage (S3, FTP, etc.) | `create`, `create_remote`, `upload`, and the `watch` command |
+| `--diff-from=<name>` | In local backups only | `create_remote`, `upload` (not plain `create`) |
+
+Other relevant options and settings:
+
+| Name | Purpose |
+| ---- | ------- |
+| `upload_by_part` (config) | Must be `true` to use `--diff-from-remote`; it is `true` by default |
+| `backups_to_keep_remote` (config) | How many remote backups to keep; must not delete backups still needed by a chain |
+| `--partitions` | Limit a backup or restore to selected partitions |
+| `rebase` (command) | Turn an incremental backup into a self-contained one |
+| `use_embedded_backup_restore` (config) | Use ClickHouse's built-in BACKUP engine instead of the file-level approach |
+
+## Test Environment
+
+The tests use the standard TestFlows environment for `clickhouse-backup`, which starts:
+
+* Two ClickHouse nodes, `clickhouse1` and `clickhouse2`, and a ZooKeeper node for coordination.
+* A `clickhouse_backup` container running the `clickhouse-backup` binary under test.
+* Remote storage backends available in the environment (for example MinIO for S3, plus FTP and SFTP servers).
+
+**ClickHouse versions under test.** Run the plan against the versions listed in
+[Which ClickHouse Versions Are Supported](#which-clickhouse-versions-are-supported). The Testflows CI matrix is
+`22.3`, `22.8`, `23.3`, `23.8`, `24.3`, `24.8`, `25.3`, `25.8`, `26.3`, selected with `CLICKHOUSE_VERSION`.
+Version-specific scenarios are gated as described there (embedded mode 22.7+, the object-disk type, and patch parts 25.7+). The default image when `CLICKHOUSE_VERSION` is unset is `26.3`.
+
+Most single-node scenarios run on `clickhouse1`. Scenarios that need more than one node (for example the
+sharded-cluster scenario) use both `clickhouse1` and `clickhouse2` via the predefined `sharded_cluster`
+configuration. To confirm a restore is complete, tests drop the table (or use a clean node) and restore into an empty target.
+
