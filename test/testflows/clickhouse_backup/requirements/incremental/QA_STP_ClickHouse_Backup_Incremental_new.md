@@ -5,8 +5,30 @@
 
 **Author:** vsviderskyi
 
-**Date:** July 16, 2026
+**Date:** July 20, 2026
 
+## Table of Contents
+
+* 1 [Introduction](#introduction)
+* 2 [How Incremental Backups Work in clickhouse-backup](#how-incremental-backups-work-in-clickhouse-backup)
+    * 2.1 [Which Part Types Are Supported](#which-part-types-are-supported)
+    * 2.2 [Which ClickHouse Versions Are Supported](#which-clickhouse-versions-are-supported)
+    * 2.3 [Backward Compatibility Across ClickHouse Versions](#backward-compatibility-across-clickhouse-versions)
+    * 2.4 [Restoring Into Empty vs. Non-Empty Tables](#restoring-into-empty-vs-non-empty-tables)
+    * 2.5 [Incremental Restore in a Multi-Replica Setup](#incremental-restore-in-a-multi-replica-setup)
+    * 2.6 [Concurrent INSERT / ALTER During Backup and Restore](#concurrent-insert-alter-during-backup-and-restore)
+    * 2.7 [Backup Storage Location and Chain Portability](#backup-storage-location-and-chain-portability)
+* 3 [Testing Approach](#testing-approach)
+    * 3.1 [Measuring Data Equivalence](#measuring-data-equivalence)
+* 4 [Scope and Relationship to Existing Tests](#scope-and-relationship-to-existing-tests)
+* 5 [Timeline](#timeline)
+* 6 [Commands and Options Used](#commands-and-options-used)
+* 7 [Test Environment](#test-environment)
+* 8 [References](#references)
+* 9 [Human Resources And Assignments](#human-resources-and-assignments)
+* 10 [Release Notes](#release-notes)
+* 11 [Test Scenarios](#test-scenarios)
+    * 11.1 [Scenario 1: Create and restore a single incremental backup](#scenario-1-create-and-restore-a-single-incremental-backup)
 
 ## Introduction
 
@@ -709,4 +731,3 @@ The following team members SHALL be dedicated to this effort:
 | ----- | -------- |
 | Data after restore | The table contains both batches of data, identical to before the drop |
 | Backup size | `inc_backup` is much smaller than `base_backup` (only the new data was stored) |
-
