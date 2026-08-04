@@ -212,12 +212,12 @@ Regular incremental works on that whole range for MergeTree-family tables. What 
 
 | Backup mode | Incremental supported? | From ClickHouse version | Notes |
 | ----------- | ---------------------- | ----------------------- | ----- |
-| **Regular** (`--diff-from`, `--diff-from-remote`) | **Yes** | above 1.1.54394 (same as the tool) | Default path for this plan; MergeTree and ReplicatedMergetree families only |
-| **Embedded** (`use_embedded_backup_restore: true` + `base_backup`) | **Yes** | **22.7+** documented; **22.8+** in Testflows | Needs `clickhouse-backup` 2.5.3+; skip on Testflows `22.3` |
+| **Regular** (`--diff-from`, `--diff-from-remote`) | **Yes** | above 1.1.54394 (same as the tool) | Default engines for this plan. MergeTree and ReplicatedMergetree families only |
+| **Embedded** (`use_embedded_backup_restore: true` + `base_backup`) | **Yes** | **22.7+** documented; **22.8+** in Testflows | Needs `clickhouse-backup` 2.5.3+. Skip on Testflows `22.3` |
 | Below tool minimum (≤ 1.1.54394) | **No** | — | Outside `clickhouse-backup` support |
 
 > [!NOTE]
-For Testflows, run embedded incremental on **22.8+** only.
+For Testflows, run embedded incremental tests on **22.8+** only.
 
 **Older ClickHouse behaviors (already true on every Testflows version).** Testflows starts at `22.3`, so
 these older thresholds are already met in old tests we run. They do not change which scenarios to skip:
@@ -229,7 +229,7 @@ these older thresholds are already met in old tests we run. They do not change w
 What still changes which scenarios to run:
 
 * **Patch parts** (lightweight `UPDATE`, 25.8+) — incremental still works, but pending patches are
-  unreliable; materialize with `APPLY PATCHES` first.
+  unreliable. Materialize with `APPLY PATCHES` first.
 * **Object disks** — S3 21.8+, GCS from S3 22.6+, Azure Blob 23.3+.
 
 In embedded mode ClickHouse computes the file-level diff itself and the base backup is passed at create time, so
@@ -255,7 +255,7 @@ Default image when `CLICKHOUSE_VERSION` is unset: **26.3** (specified in `test/t
 ### Backward Compatibility Across ClickHouse Versions
 
 A common real-world case is a chain that runs for a long time (for example a year) while the ClickHouse server is
-upgraded underneath it: the **full/base backup was created on an older version X**, and later **incremental
+upgraded underneath it. The **full/base backup was created on an older version X**, and later **incremental
 backups are created on a newer version Y**. Two questions follow from that, and both are answered by how
 `clickhouse-backup` decides to reuse a part.
 
@@ -272,7 +272,7 @@ compares the ClickHouse version** that created a backup. Separately, each backup
 field is informational only: nothing in create, upload, download, or restore reads it back to gate reuse or
 restore.
 
-**Q1 — Base created on version X, increments created on version Y (X older, Y newer): is that supported?**
+**Q1 — Base created on version X, increments created on version Y (X older, Y newer). Is that supported?**
 
 **Yes**, from `clickhouse-backup`'s side. Because reuse is decided purely by part name + fingerprint:
 
@@ -287,10 +287,10 @@ This relies on one ClickHouse property that this plan treats as an assumption to
 guarantee. ClickHouse data parts are **immutable**, so a version upgrade does not rewrite existing parts in
 place — they change only when a merge or mutation runs.
 
-> Caveat (not relevant to modern upgrades): reuse only deduplicates when both sides expose the **same kind of
+> LImitation (not relevant to modern upgrades): reuse only deduplicates when both sides expose the **same kind of
 > fingerprint**. A backup made on ClickHouse **< 19.11** stores only the legacy CRC64 checksum, while **≥ 19.11**
-> stores `hash_of_all_files` and does not compute the CRC64. If a chain straddles the 19.11 boundary, a
-> name-matched part fails the fingerprint check and is re-uploaded — the restore is still correct, it just
+> stores `hash_of_all_files` and does not compute the CRC64. If a chain includes the 19.11 boundary, a
+> name-matched part fails the fingerprint check and is re-uploaded. The restore is still correct, it just
 > stops saving space. Any realistic multi-year upgrade (for example 24.x → 25.x) stays above 19.11, so
 > both sides use `hash_of_all_files` and dedup works normally.
 
@@ -331,7 +331,7 @@ schema and restore data from backup"*):
 
 Because both `--schema` and `--data` default to false, a bare `clickhouse-backup restore <backup>` runs
 **schema *and* data**. Also because the schema step runs, `RestoreSchema` calls `dropExistsTables`
-**unconditionally** — so by default  the table is **dropped and recreated**. You do **not** need `--rm` to
+**unconditionally**. So by default  the table is **dropped and recreated**. You do **not** need `--rm` to
 get a clean, non-duplicating restore; `--rm`/`--drop` only matters when you also pass `--data` (it forces a drop
 on the otherwise-additive data-only path). The only way to *skip* the drop is to explicitly ask for data-only
 with `--data` parameter. All of this applies **unchanged** to an incremental backup. The flags mean exactly what they mean
@@ -340,7 +340,7 @@ for a full backup.
 **How schema restore treats an existing table.** 
 
 Whenever `clickhouse-backup` restores *schema* (for either a
-full or an incremental backup), it first **drops the existing object** and recreates it: `RestoreSchema` calls
+full or an incremental backup), it first **drops the existing object** and recreates it.  `RestoreSchema` calls
 `dropExistsTables` unconditionally, which issues `DROP TABLE IF EXISTS` (or `DETACH` when
 `--restore-schema-as-attach` is used) before the `CREATE` (`pkg/backup/restore.go` `RestoreSchema` →
 `dropExistsTables`; `pkg/clickhouse/clickhouse.go` `DropOrDetachTable`). So schema restore is destructive by
@@ -350,7 +350,7 @@ design — it deletes and re-creates. It does not merge into the existing defini
 
 Data restore copies the backup's parts (including the `required`
 parts collected from the rest of the chain) into the table's `detached/` directory and runs
-`ALTER TABLE ... ATTACH PART` for each one; this step **never** truncates and is purely **additive**.
+`ALTER TABLE ... ATTACH PART` for each one. This step **never** truncates and is purely **additive**.
 Incremental restore uses the **same** attach step as a full restore.
 
 Putting the two together gives the actual behavior per restore mode (this is the answer for non-empty targets):
@@ -365,7 +365,7 @@ Putting the two together gives the actual behavior per restore mode (this is the
 | Embedded (`use_embedded_backup_restore: true`) | depends on flags as above | schema step drops; data step uses native `RESTORE ... SETTINGS allow_non_empty_tables=1` for `--data` | `allow_non_empty_tables=1` lets ClickHouse restore into a non-empty table; the additive caveat applies to this command |
 
 So the short answer: a **default full restore deletes the existing table first and recreates it** (no
-duplication); a **data-only (`--data`) restore does not delete anything and attaches on top**, which is the one
+duplication); a **data-only (`--data`) restore does not delete anything and attaches on top**. This is the one
 mode where a non-empty target can produce wrong data. A safety check can additionally abort a schema-dropping
 restore and require `--rm`/`--drop` when the target tables already contain rows and `restore_schema_on_cluster`
 is configured.
@@ -375,7 +375,7 @@ each situation, for the two restore modes that matter (a plain `restore`, which 
 versus a data-only `restore --data`):
 
 * **1. Target table does not exist, or exists but is empty.** Both modes give a faithful copy. A plain `restore`
-  drops (a no-op when the table is absent or empty) and recreates from the backup schema, then attaches the
+  drops (a no-op when the table is absent or empty) and recreates from the backup schema. Then it attaches the
   parts; `restore --data` simply attaches into the empty table. There are no pre-existing rows, so nothing can
   be duplicated.
 * **2. Target table already contains data.**
