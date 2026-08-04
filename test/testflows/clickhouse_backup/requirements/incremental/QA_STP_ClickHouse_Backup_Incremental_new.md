@@ -375,9 +375,9 @@ each situation, for the two restore modes that matter (a plain `restore`, which 
 versus a data-only `restore --data`):
 
 * **1. Target table does not exist, or exists but is empty.** Both modes give a faithful copy. A plain `restore`
-  drops (a no-op when the table is absent or empty) and recreates from the backup schema. Then it attaches the
-  parts; `restore --data` simply attaches into the empty table. There are no pre-existing rows, so nothing can
-  be duplicated.
+  runs `DROP TABLE IF EXISTS` (safe if the table is missing. If it exists but is empty, there is nothing to
+  lose), recreates it from the backup schema, then attaches the parts. `restore --data` simply attaches into
+  the empty table. There are no pre-existing rows, so nothing can be duplicated.
 * **2. Target table already contains data.**
   * *Plain `restore` (schema + data), `--schema`, or `--rm`/`--drop`:* the table is **dropped**
     (`DROP TABLE IF EXISTS`) and recreated, so the pre-existing rows are **destroyed** and replaced by the
