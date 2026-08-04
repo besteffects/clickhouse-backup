@@ -91,14 +91,18 @@ parts from the earlier backups in the chain automatically.
 The chain is **linear** — each backup records exactly one base backup, so every
 new incremental backup adds one more link. There is **no fixed limit** on chain depth in `clickhouse-backup` curerntly.
 It follows the chain of base backups recursively until it reaches the full backup at the start. In practice, the
-depth is controlled by how the backups are managed by users, not by the tool:
+depth is controlled by how the backups are managed by users, not by the tool.
 
 Basic commands:
 * The `watch` command (and scheduled backups) periodically makes a new *full* backup, which starts a fresh
   chain, so the depth resets each full cycle.
 * The `rebase` command collapses a chain by turning an incremental backup into a self-contained one.
-* Retention (`backups_to_keep_remote`) only removes backups that no remaining chain still needs, so it never
-  breaks a chain that is still in use.
+* Retention (`backups_to_keep_remote`) counts **all** remote backups (full and incremental). It keeps the
+  newest N, then **skips deleting** any older backup still reachable via `required_backup` from those kept
+  ones — including the **full/base** and any intermediate increment
+  (`GetBackupsToDeleteRemote` in `pkg/storage/compression.go`). So, the base is **protected from automatic
+  deletion** while a kept backup still depends on it. It is **not** undeletable forever, and a manual
+  `delete` can still remove it (see Retention cost below).
 
 **Chain compaction (`rebase`).** The `rebase` command turns an incremental backup into a complete, standalone
 backup. It works by walking the whole chain (from the chosen backup back to its full backup), finding every
@@ -106,7 +110,7 @@ part that was "reused" from an earlier backup, and copying those parts into the 
 directly on the remote storage (a server-side copy), so data is not downloaded and re-uploaded. Afterwards the
 backup no longer records a base backup — it becomes a full backup on its own, and all of its former earlier
 backups can be deleted without affecting it. This works for regular remote backups uploaded with
-`upload_by_part: true`; it is not available for embedded backups.
+`upload_by_part: true`. It is not available for embedded backups.
 
 **Chain Depth**
 
@@ -128,7 +132,7 @@ with `full_type=rebase`, and retention can trigger it via `rebase_before_remove_
 This matches how `rebase` is described in the `clickhouse-backup` source code:
 
 > Rebase - copy required parts from the required backups chain into backupName on remote storage
-> and remove the required_backup dependency, so backupName becomes a full backup
+> and remove the required_backup dependency, so backupName becomes a full backup.
 
 The official description of this behavior is in the clickhouse-backup documentation (see
 [References](#references)).
@@ -137,7 +141,7 @@ The official description of this behavior is in the clickhouse-backup documentat
 
 `clickhouse-backup` copies a part by simply taking the files that make up that part (using
 `ALTER TABLE ... FREEZE`). It decides whether to reuse a part or upload it again based only on the part's
-**name** and a fingerprint of its files — it never looks at how the part is organized inside. Because of that, the way ClickHouse stores a part does not affect the backup: all storage variations are handled the same way.
+**name** and a fingerprint of its files. It never looks at how the part is organized inside. Because of that, the way ClickHouse stores a part does not affect the backup: all storage variations are handled the same way.
 
 To keep things clear, it helps to separate three different ideas that are easy to mix up: the **part type**, the **on-disk storage format**, and the **kind/state** of a part.
 
@@ -151,10 +155,10 @@ To keep things clear, it helps to separate three different ideas that are easy t
 
 Both are backed up and reused identically. 
 
-Older ClickHouse versions also had an experimental `InMemory` part type that was never written to disk; it has been removed and is not relevant here.
+Older ClickHouse versions also had an experimental `InMemory` part type that was never written to disk. It has been removed and is not relevant here.
 
 **2. On-disk storage format: Full or Packed.** This is a separate ClickHouse concept that only changes how a part's files are laid out on disk — either as individual files (**Full**) or bundled into a single archive
-(**Packed**). Since `clickhouse-backup` copies whatever files a part consists of, both formats are captured the same way. Packed storage is a newer option, so it has to be tested. But it does not change how incremental reuse works.
+(**Packed**). Since `clickhouse-backup` copies whatever files a part consists of, both formats are captured the same way. Packed storage is a newer option, so it has to be tested. But it does not change how incremental backup reuse works.
 
 **3. Kind and state of a part.** Regardless of type or storage format, a part can come from different
 operations or be in different states. This is where support is different:
@@ -162,7 +166,7 @@ operations or be in different states. This is where support is different:
 | Kind / state of part | Backed up and reused? | Explanation |
 | -------------------- | --------------------- | ----------- |
 | **Regular data part** (from a normal `INSERT`) | Yes | The normal case — this is what incremental backup is designed around. |
-| **Part left by a classic mutation** (`ALTER TABLE ... UPDATE`/`DELETE`) | Yes (as new data) | A finished mutation writes brand-new parts with new names; the backup uploads them as new. In-progress mutations are recorded separately (`backup_mutations`). |
+| **Part left by a classic mutation** (`ALTER TABLE ... UPDATE`/`DELETE`) | Yes (as new data) | A finished mutation writes brand-new parts with new names. The backup uploads them as new. In-progress mutations are recorded separately (`backup_mutations`). |
 | **Projection parts** (a projection stored inside a part) | Yes, together with their parent part | They live inside the part's directory, so they are copied with it. Specific projections can be excluded with a skip-projections option. |
 | **Patch part** (from a lightweight `UPDATE`) | Not reliably — see note below | Needs to be materialized first; explained in the note. |
 | **Detached part** | No | Not part of the table's live data, so ClickHouse does not include it when freezing. |
@@ -197,7 +201,7 @@ still backed up, just not incrementally). Tables whose data lives in an external
 
 **Short answer:** on every ClickHouse version in the Testflows matrix tests
 (`22.3` … `26.3 (latest currently)`), **regular part-level incremental backups are supported** (`--diff-from` /
-`--diff-from-remote`). There is no Testflows version where regular incremental is “not supported”.
+`--diff-from-remote`). There is no ClickHouse version specified in TestFlows test matrix where regular incremental is “not supported”.
 
 `clickhouse-backup` itself supports ClickHouse **above 1.1.54394**
 ([ReadMe — Limitations](https://github.com/Altinity/clickhouse-backup/blob/master/ReadMe.md#limitations)).
@@ -208,21 +212,21 @@ Regular incremental works on that whole range for MergeTree-family tables. What 
 
 | Backup mode | Incremental supported? | From ClickHouse version | Notes |
 | ----------- | ---------------------- | ----------------------- | ----- |
-| **Regular** (`--diff-from`, `--diff-from-remote`) | **Yes** | above 1.1.54394 (same as the tool) | Default path for this plan; MergeTree-family only |
+| **Regular** (`--diff-from`, `--diff-from-remote`) | **Yes** | above 1.1.54394 (same as the tool) | Default path for this plan; MergeTree and ReplicatedMergetree families only |
 | **Embedded** (`use_embedded_backup_restore: true` + `base_backup`) | **Yes** | **22.7+** documented; **22.8+** in Testflows | Needs `clickhouse-backup` 2.5.3+; skip on Testflows `22.3` |
 | Below tool minimum (≤ 1.1.54394) | **No** | — | Outside `clickhouse-backup` support |
 
 > [!NOTE]
 For Testflows, run embedded incremental on **22.8+** only.
 
-**Related version notes.** For Testflows (`22.3`+), the old
-implementation floors below are already satisfied on every cell, so they do **not** need their own table rows for deciding what to run:
+**Older ClickHouse behaviors (already true on every Testflows version).** Testflows starts at `22.3`, so
+these older thresholds are already met in old tests we run. They do not change which scenarios to skip:
 
-* `hash_of_all_files` fingerprint — 19.11+ (`pkg/backup/create.go`; older CH used CRC64 of `checksums.txt`)
-* hard-linked freeze out of `shadow` — 21.4+ (`pkg/filesystemhelper`)
+* `hash_of_all_files` fingerprint — since 19.11 (`pkg/backup/create.go`. Older CH used CRC64 of `checksums.txt`)
+* hard-linked freeze out of `shadow` — since 21.4 (`pkg/filesystemhelper`)
 * `ALTER TABLE ... UNFREEZE` after backup — above 21.4 (`pkg/backup/create.go`)
 
-What *does* still gate scenarios in this plan:
+What still changes which scenarios to run:
 
 * **Patch parts** (lightweight `UPDATE`, 25.8+) — incremental still works, but pending patches are
   unreliable; materialize with `APPLY PATCHES` first.
