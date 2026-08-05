@@ -390,12 +390,12 @@ versus a data-only `restore --data`):
 * **3. Target table has a *different schema* than the backup.**
   * *Plain `restore` / `--schema` / `--rm`:* the existing table is dropped **by name, regardless of its current
     structure**, and recreated from the backup's `CREATE` statement. The target's different schema **and** its
-    data are gone; you end up with the backup's schema and data. `clickhouse-backup` does **not** compare or
-    merge the two definitions — it replaces, so a differently-defined target table is silently destroyed.
+    data are gone. You end up with the backup's schema and data. `clickhouse-backup` does **not** compare or
+    merge the two definitions, it replaces them. So a differently-defined target table is silently destroyed.
   * *`restore --data` (data-only):* the schema is **not** touched, so the table keeps its different structure.
     ClickHouse then validates each backup part against that structure during `ALTER TABLE ... ATTACH PART`. If
     the structures are **incompatible** (differing columns, types, sorting/partition key), ClickHouse rejects
-    the attach and the **restore fails with an error**; if they happen to be **compatible**, the parts attach
+    the attach and the **restore fails with an error**. If they happen to be **compatible**, the parts attach
     (subject to the duplication caveat above). `clickhouse-backup` does not reconcile the schema difference in
     this mode — it relies on ClickHouse's part-vs-table validation.
   * *A `PARTITION BY` mismatch is a specific, important case of the above.* Every data part carries a
@@ -403,27 +403,27 @@ versus a data-only `restore --data`):
     written, and it is stored with the part (the part directory is named `<partition_id>_<min>_<max>_<level>`).
     On `ATTACH PART`, ClickHouse re-derives the `partition_id` from the **target table's** current `PARTITION BY`
     and requires it to match the part being attached. So a data-only restore of parts produced under the
-    backup's `PARTITION BY` into a table defined with a **different** `PARTITION BY` is rejected — the attach
-    fails and the restore errors out; `clickhouse-backup` does not (and cannot safely) re-partition the data. In
+    backup's `PARTITION BY` into a table defined with a **different** `PARTITION BY` is rejected. The attach
+    fails and the restore fails with errors. `clickhouse-backup` does not (and cannot safely) re-partition the data. In
     every other restore mode this cannot happen, because the schema step recreates the table from the backup's
     own `CREATE`, so the partition expression always matches.
 
 **Where this can cause incorrect data (but not corruption).** The risk exists **only on the `--data`
-(data-only) path**, and it is always *logical* — extra or double-counted rows — never damaged part files:
+(data-only) path**, and it is always *logical*: extra or double-counted rows, never damaged part files:
 
 * **Duplicated rows** on plain `MergeTree` when `--data` attaches parts over overlapping existing rows.
   ClickHouse assigns fresh block numbers to attached detached parts, so nothing is overwritten and no error is
-  raised; `clickhouse-backup` does not detect or warn about the resulting duplicates.
+  raised. `clickhouse-backup` does not detect or warn about the resulting duplicates.
 * **Misleading results on deduplicating/aggregating engines.** `ReplacingMergeTree`, `SummingMergeTree`, and
   `AggregatingMergeTree` only collapse or sum duplicates during background merges. Right after an additive
-  `--data` restore the table can show doubled counts or sums until a merge (or a `FINAL` query) runs, so a
+  `--data` restore the table can show doubled counts or sums until a merge (or a `FINAL` query) runs. So a
   row-count check taken too early can both hide a real problem or flag a non-problem.
 * **Partial-partition surprises.** Restoring an increment scoped with `--partitions` onto a table that has
-  other partitions replaces only the named partitions; the rest of the table is intentionally left as-is. That
+  other partitions replaces only the named partitions. The rest of the table is intentionally left as-is. That
   is correct behavior but must be accounted for when comparing against a full-table expectation.
 
-The safe rules of thumb, which the scenarios below encode: a plain `restore` (or `--rm`) gives a faithful copy
-because it drops and recreates the table; use `--data --partitions=...` to **replace** specific partitions; and
+The safe rules of thumb, which the scenarios below should implement: a plain `restore` (or `--rm`) gives a faithful copy
+because it drops and recreates the table. Use `--data --partitions=...` to **replace** specific partitions; and
 only use a bare `--data` restore onto a populated table when you deliberately want to merge datasets and can
 tolerate (or later deduplicate) overlaps.
 
