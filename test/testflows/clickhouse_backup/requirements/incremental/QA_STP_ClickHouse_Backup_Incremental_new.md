@@ -432,9 +432,9 @@ tolerate (or later deduplicate) overlaps.
 
 `clickhouse-backup` is a **per-node** tool: each invocation talks to one ClickHouse server and only reads/writes
 that node's local data. It does **not** do a restore out to every replica by itself. In a cluster of
-`Replicated*` tables the missing piece is filled by ClickHouse's own replication: parts attached on one
+`Replicated*` tables the missing piece is filled by ClickHouse's own replication. Parts attached on one
 replica are propagated to the other replicas of the same shard through Keeper/ZooKeeper. This is also true for full
-backups and, in exactly the same way, for **incremental** backups — the incremental nature only affects which
+backups and, in exactly the same way, for **incremental** backups. The incremental nature only affects which
 parts get attached on the one node that runs the data restore, not how they spread to the sibling nodes.
 
 **Do we restore on one replica or all of them? Split the answer into schema and data.** The recommended and
@@ -444,7 +444,7 @@ tested pattern (see the Kubernetes restore `Job` and the sharded-cluster recipe 
 | Restore step | Where to run it | Why |
 | ------------ | --------------- | --- |
 | **Schema** (`restore_remote --schema --rm`) | **Every replica** in each shard (or once with `restore_schema_on_cluster` / `ON CLUSTER`) | Each replica must have its own local table definition and must register its own replica entry in Keeper before it can receive data |
-| **Data** (`restore_remote --data`) | **Only the first replica** of each shard | The attached parts replicate automatically to the other replicas; running `--data` on more than one replica of the same shard attaches the same parts twice and **duplicates rows** |
+| **Data** (`restore_remote --data`) | **Only the first replica** of each shard | The attached parts replicate automatically to the other replicas. Running `--data` on more than one replica of the same shard attaches the same parts twice and **duplicates rows** |
 
 **Important: the "data on only the first replica" rule applies *only* to the `Replicated*` engines family.**
 It is a direct consequence of ClickHouse replication that copies parts between replicas. Plain (non-replicated) `MergeTree`-family tables has no such mechanism. The distinction is fundamental to how
@@ -456,7 +456,7 @@ data restore must be run across nodes:
 | **Plain `MergeTree` family** (`MergeTree`, `ReplacingMergeTree`, `SummingMergeTree`, `AggregatingMergeTree` and so on, *without* the `Replicated` prefix) | **No** — each node is an independent local table | **Every node** that must hold the data (there are no "replicas" to propagate to) | No cross-node duplication from replication (nothing propagates).|
 
 So for a plain `MergeTree` table there is no such thing as "restore on the first replica and let it spread". It won't be copied. If two nodes each carry a plain `MergeTree` table of the same name, they are **independent**
-tables; restoring data on node A leaves node B empty. To end up with the same data on several nodes you must run
+tables. Restoring data on node A leaves node B empty. To end up with the same data on several nodes you must run
 the **data** restore on **each** of them (and each node needs the backup. For an increment, the full
 chain is available locally). In practice a plain `MergeTree` in a multi-node cluster is normally used **per
 shard behind a `Distributed` table** (each node holds a *different* slice of the data). So you back up and
@@ -465,7 +465,7 @@ cases — it always runs on every node.
 
 **What is incremental-specific here.** When you run the `--data` step on the first replica, `clickhouse-backup`
 attaches that increment's **own** parts **plus** the `required` parts it pulls from the base backups in the
-chain (`prepareRequiredPartsForRestore`; recursive `Download` of `RequiredBackup`). ClickHouse replication then
+chain (`prepareRequiredPartsForRestore`, recursive `Download` of `RequiredBackup`). ClickHouse replication then
 copies the **resulting final parts**. Base-chain parts and increment parts are alike to the sibling replicas.
 The consequence worth testing: **only the one replica that runs `--data` needs access to the full backup chain**
 (and needs the base backups downloaded locally). The other replicas reconstruct the same data purely through
@@ -493,50 +493,55 @@ redundant copies of the same replicated data.
 
 ### Concurrent INSERT / ALTER During Backup and Restore
 
-Another question is illustrated by the `partA + partB → partC` merge in the request - is what an incremental
-backup captures when the table keeps changing **while** the backup (or restore) is running. `clickhouse-backup`
-does **not** stop merges or makes a table lock. It relies on ClickHouse's
-part-level atomicity instead. The behavior is the same for full and incremental backups. 
+Another question is what an incremental backup captures when the table keeps changing **while** the backup
+(or restore) is running. For example, a merge `partA + partB → partC`. `clickhouse-backup` does **not** stop
+background merges and does **not** lock the table. It only freezes whatever finished parts exist at that
+moment. The same rules
+apply to full and incremental backups. 
 
-But it is called out here because the *deduplication* outcome (reuse vs. re-upload) is what makes it visible on an increment.
+For increments, the practical effect is size. A merge that finishes during the backup can make the
+increment upload more data than expected (the new merged part instead of reusing the old ones).
 
 **During backup creation.** `clickhouse-backup` runs `ALTER TABLE ... FREEZE`, which tells ClickHouse to
 hard-link a copy of every **active** part (live data that is already finished — not `tmp_...` in-progress
 parts, not `detached/`). That FREEZE moment is the cutoff: only those parts enter the backup. Concurrent
 work is judged only by whether it finished **before** or **after** that moment:
 
-* **Parallel INSERT.** A part is either *active* at freeze time (fully included) or it is not (fully excluded) —
-  parts are atomic, so there are never half-written parts in a backup. Rows inserted **before** freeze are in
-  the backup; rows inserted **after** are not. For an increment this simply means the just-inserted new parts
+* **Parallel INSERT.** A part is either *active* at freeze time (fully included) or it is not (fully excluded).
+  Parts are atomic, so there are never half-written parts in a backup. Rows inserted **before** freeze are in
+  the backup rows inserted **after** are not. For an increment this simply means the just-inserted new parts
   are uploaded as new data. Unchanged older parts are still reused from the base.
 * **Parallel merge (the `partC` case).** A merge that combines `partA + partB` into `partC` does not lose or
-  change rows — but it produces a **new part with a new name and a new `hash_of_all_files`**. What the increment
+  change rows, but it produces a **new part with a new name and a new `hash_of_all_files`**. What the increment
   stores depends on whether that merge finished before the increment's freeze:
   * *Merge completed before freeze:* the active set is `{partC}`. `partC` is **not** present in the base (the
-    base had `partA`, `partB`), so the increment cannot deduplicate it and **uploads `partC` as new data** —
+    base had `partA`, `partB`), so the increment cannot deduplicate it and **uploads `partC` as new data**,
     re-storing rows that the base already held inside `partA + partB`. The restore is still correct (`partC`
-    contains all the rows). But the increment is larger than a "pure delta".
-  * *Merge not yet completed at freeze:* the active set is still `{partA, partB}`, both are found in the base by
-    name + fingerprint, so the increment **reuses** them and uploads only changed data.
+    contains all the rows).
+  * *Merge not yet completed at freeze:* `partC` does **not** exist yet as an active part (or is still
+    `tmp_...`). So it is **not** uploaded. The active parts are still `partA` and `partB`. Both match the base
+    by name + fingerprint, so the increment **reuses** them and does not re-upload those part files.
   * Either way there is **no data loss or corruption** — only a difference in **how much the increment re-uploads**.
 * **Parallel ALTER.**
   * *Metadata-only `ALTER`* (TTL, comment, index add) is fast and rewrites no parts. The schema captured for the
     backup is whatever `SHOW CREATE TABLE` returned when the table list was built.
   * *Data-rewriting `ALTER` / mutation* (`ALTER ... UPDATE`/`DELETE`, `MODIFY COLUMN` that rewrites) produces
-    **new mutation parts** with new names. They then become the active parts the freeze captures — so the
+    **new mutation parts** with new names. They then become the active parts the freeze captures. So the
     increment re-uploads them as new data. In-progress mutations are recorded once per backup
-    (`GetInProgressMutationsBatch` over `system.mutations`, gated by `backup_mutations`) so a restore can carry
+    (`GetInProgressMutationsBatch` over `system.mutations`, gated by `backup_mutations`), so a restore can carry
     pending mutations forward (restore side needs `restore_as_attach`).
-  * *Column-type races are actively guarded.* If a concurrent `ALTER ... MODIFY COLUMN` leaves the active parts
-    with **inconsistent column types** (some parts old type, some new) mid-backup, the default
-    `check_parts_columns: true`  **aborts** backup with *"inconsistent data types for active data part"*
-    (`CheckSystemPartsColumnsForTables`, `pkg/clickhouse/clickhouse.go`) rather than produces a corrupt backup.
-    It is true unless you explicitly pass `--skip-check-parts-columns`.
+  * *Column-type races are guarded on backup **create** (not restore).* If a concurrent
+    `ALTER ... MODIFY COLUMN` leaves active parts with **inconsistent column types** (some parts old type,
+    some new), default `check_parts_columns: true` **aborts backup creation** with *"inconsistent data types
+    for active data part"* (`CheckSystemPartsColumnsForTables`, `pkg/clickhouse/clickhouse.go`). It does not
+    produce a corrupt backup (ReadMe: guarantee the mutation is complete). Then either wait for the mutation
+    to finish and retry `create`, or force create with `--skip-check-parts-columns` (allows inconsistent
+    column types — only if you accept that risk).
   * *CREATE/DROP races* are tolerated: `ignore_not_exists_error_during_freeze: true` (default) ignores
     ClickHouse error codes 60/81 so frequent CREATE/DROP of tables during a backup does not fail the whole run.
-* **No cross-table instant.** FREEZE is atomic **per table**, so a multi-table backup is a set of per-table
+* **No cross-table instant.** FREEZE is atomic **per table**. So a multi-table backup is a set of per-table
   snapshots taken at slightly different moments, not one cluster-wide instant. For a single table the snapshot
-  is consistent; across tables.
+  is consistent across tables.
 
 **During restore.** Restore is **not** designed to run against a table that is being written concurrently. The
 intended pattern is to restore into a inactive target. A default `restore` gives that by dropping and recreating
@@ -544,7 +549,7 @@ the table first.
 
 * *Default `restore` (schema + data)* drops and recreates the table, then attaches parts. A client that writes
   to the table during the drop/recreate window can see *"table doesn't exist"* or lose those writes when the
-  table is replaced. This is expected and is why restores should run during a maintenance window.
+  table is replaced. This is expected and it is why restores should run during a maintenance window.
 * *`restore --data`* is additive, so a concurrent `INSERT` blended with `ATTACH PART` produces **duplicated
   / overlapping rows** (never corruption — block numbers keep parts valid). The same additive caveat as a
   non-empty target.
@@ -552,9 +557,9 @@ the table first.
   at once, and `restore_as_attach: true` to restore tables that have in-progress mutations or an inconsistent
   part structure.
 
-The practical rule the scenarios encode: incremental **backup** creation is safe to run against a live,
-writing table (FREEZE gives a consistent per-table snapshot; concurrent merges only affect dedup efficiency,
-and a racing column-type ALTER aborts the backup rather than corrupting it), but **restore** should target a
+**The practical rule the scenarios encode:** incremental backup creation is safe to run against a live,
+writing table. FREEZE gives a consistent per-table snapshot, concurrent merges only affect dedup efficiency,
+and a racing column-type ALTER aborts the backup rather than corrupting it. However, **restore** should target a
 locked table.
 
 
@@ -563,7 +568,7 @@ locked table.
 An incremental backup depends on its base, so a question is *where* that dependency is resolved. Should
 the whole chain live in one place, and what breaks if you change the storage type or the folder? The design is simple.
 
-**How the dependency is recorded — by name only.** When an increment is uploaded with `--diff-from-remote=<base>`,
+**The dependency is recorded by name only.** When an increment is uploaded with `--diff-from-remote=<base>`,
 `clickhouse-backup` stores the base **name** in the increment's `metadata.json` as `required_backup: <base>`
 (`pkg/backup/upload.go`; `backupMetadata.RequiredBackup = diffFromRemote`). It stores **no** endpoint, no
 storage type, no bucket, and no path — just the name. On restore/download the tool resolves that name
@@ -572,7 +577,7 @@ storage type, no bucket, and no path — just the name. On restore/download the 
 `'<name>' is not found on remote storage`.
 
 **Consequence: the entire chain must live in one remote storage, under one path.** Because resolution is
-name-based against the single configured remote, the base and **every** increment in the chain must be
+name-based against the single configured remote. The base and **every** increment in the chain must be
 co-located in the **same** `remote_storage` (same type), the **same** bucket/host, and the **same** `path`
 prefix. You **cannot** split a chain. For example keep the base in one bucket and push increments to another is not a good approach
 because both the increment *upload* (which reads the base via `getTablesDiffFromRemote`) and the later
@@ -590,7 +595,7 @@ because both the increment *upload* (which reads the base via `getTablesDiffFrom
 **Object-disk backups need their data moved too.** For tables on object disks, the part data is stored under
 the storage's `object_disk_path` (separate from the metadata `path`). Migrating a chain of object-disk backups
 means copying **both** the backup `path` tree **and** the referenced `object_disk_path` data, and a restore into
-a different account/bucket may require object-disk key rewriting — so a storage move is heavier for object-disk
+a different account/bucket may require object-disk key rewriting. So a storage move is heavier for object-disk
 chains than for regular ones.
 
 **Safer ways to change storage.** Two tool-supported patterns avoid a fragile chain move:
@@ -598,10 +603,10 @@ chains than for regular ones.
 * **Start a new full backup in the new location** and begin a fresh chain there. The old chain stays intact in
   the old storage for as long as you keep it for restore.
 * **Rebase first** `clickhouse-backup` `rebase`, to make a chosen backup
-  **self-contained** — it then carries all its parts and no longer has a `required_backup`.So that single
+  **self-contained** — it then carries all its parts and no longer has a `required_backup`. So that single
   backup can be copied to the new storage and restored on its own.
 
-  ## Testing Approach
+## Testing Approach
 
 Each test follows the same simple idea:
 
@@ -612,7 +617,7 @@ Each test follows the same simple idea:
 
 Unless a scenario says otherwise, restore is done onto an empty target (or a clean node) so the restored data
 can be compared directly against the source. Note that a plain `restore` also **drops and recreates** an
-existing table before restoring, so it is faithful even against a populated target. Restoring into a table that
+existing table before restoring. So it is faithful even against a populated target. Restoring into a table that
 already has data becomes a concern only with a data-only (`--data`) restore.
 
 For every test we confirm two things:
