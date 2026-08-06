@@ -1219,7 +1219,7 @@ At minimum, cover: Wide+Full, Compact+Full, and one Packed case (for example Com
 
 **Goal:** Document and verify the limitation that pending **patch parts** created by lightweight `UPDATE` are not
 reliably backed up by `clickhouse-backup`, and confirm the safe workaround (`APPLY PATCHES` before backup). This
-is a negative scenario: it shows the failure modes so users know to materialize patches first.
+is a negative scenario. It shows the failure modes and proves to materialize patches first.
 
 > Applies to ClickHouse versions where lightweight `UPDATE` / patch parts exist (25.7+, on by default in 25.8+).
 > A patch part lives in a separate partition named `patch-<hash>-<original_partition_id>`, and `clickhouse-backup`
@@ -1229,7 +1229,7 @@ is a negative scenario: it shows the failure modes so users know to materialize 
 
 *Case A — partition-scoped backup misses the patch part (negative):*
 
-1. Create a `MergeTree` table with data in partition `p1`; make a full backup.
+1. Create a `MergeTree` table with data in partition `p1` -> make a full backup.
 2. Run a lightweight `UPDATE` that changes rows in `p1` (do NOT apply patches). Confirm a patch part appears in
    `system.parts` in a `patch-...` partition.
 3. Make an incremental backup limited to the original partition:
@@ -1238,16 +1238,16 @@ is a negative scenario: it shows the failure modes so users know to materialize 
 
 *Case B — the safe workaround (positive control):*
 
-5. On the original table (with the pending update), run `ALTER TABLE ... APPLY PATCHES` (or wait for merges) so
-   the update is written into ordinary parts. Confirm no `patch-...` partition remains.
+5. On the original table (with the pending update), run `ALTER TABLE ... APPLY PATCHES` (or wait for merges), so
+   the update is written into ordinary parts. Make sure no `patch-...` partition remains.
 6. Make an incremental backup and restore it onto an empty table.
 
 **Expected result:**
 
 | What is checked | Expected |
 | ----- | -------- |
-| Case A — update lost | The partition-scoped backup does not include the patch part, so the restored `p1` data does **not** reflect the lightweight update (this demonstrates the limitation) |
-| Case B — update preserved | After `APPLY PATCHES`, the update is in an ordinary part; the incremental backup includes it and the restored data reflects the update correctly |
+| Case A — update lost | The partition-scoped backup does not include the patch part. So the restored `p1` data does **not** reflect the lightweight update (this demonstrates the limitation) |
+| Case B — update preserved | After `APPLY PATCHES`, the update is in an ordinary part. The incremental backup includes it and the restored data reflects the update correctly |
 | Guidance confirmed | The scenario confirms the recommendation: materialize patch parts with `APPLY PATCHES` before backing up |
 
 > [!NOTE]
@@ -1257,14 +1257,14 @@ is a negative scenario: it shows the failure modes so users know to materialize 
 ### Scenario 24: Incremental backup across a ClickHouse version upgrade
 
 **Goal:** Confirm a chain that starts on an older ClickHouse version X and continues on a newer version Y works
-correctly — unchanged parts carried from the base (created by X) are reused, parts written by Y are uploaded as
+correctly. Unchanged parts carried from the base (created by X) are reused. Parts written by Y are uploaded as
 new, and the final restore is correct. This verifies the compatibility statements in
 [Backward Compatibility Across ClickHouse Versions](#backward-compatibility-across-clickhouse-versions).
 
 > `clickhouse-backup` decides part reuse by name + content fingerprint and never compares the ClickHouse
-> version, so this scenario really tests the assumption that ClickHouse keeps immutable parts stable across an
+> version. So this scenario tests the assumption that ClickHouse keeps immutable parts stable across an
 > upgrade. Pick X and Y from the [supported versions](#which-clickhouse-versions-are-supported) (for example a
-> recent LTS as X and a newer release as Y); both MUST be ≥ 19.11 so the fingerprint stays `hash_of_all_files`
+> recent LTS as X and a newer release as Y). Both MUST be ≥ 19.11 so the fingerprint stays `hash_of_all_files`
 > on both sides.
 
 **Steps:**
@@ -1273,44 +1273,41 @@ new, and the final restore is correct. This verifies the compatibility statement
    `SYSTEM STOP MERGES`, insert data, and record each part's name and `hash_of_all_files` from `system.parts`.
 2. Make a full remote backup `base_backup` (created by X). Confirm its `metadata.json` `clickhouse_version`
    reports X.
-3. Stop ClickHouse and **upgrade the server to the newer version Y**, keeping the same data directory. Restart
-   and confirm the existing parts keep the same names and `hash_of_all_files` (they were not rewritten by the
+3. **upgrade the server to the newer version Y**, keeping the same data directory. Confirm the existing parts keep the same names and `hash_of_all_files` (they were not rewritten by the
    upgrade).
 4. On version Y, add data to a new partition (and optionally rewrite one existing partition with
-   `OPTIMIZE TABLE ... FINAL` to force a Y-created part), then make an incremental backup
+   `OPTIMIZE TABLE ... FINAL` to force a Y-created part). Then make an incremental backup
    `create_remote --diff-from-remote=base_backup inc_backup` (created by Y). Confirm its `clickhouse_version`
    reports Y.
 5. On a clean target, restore the schema and then restore `inc_backup` onto an empty table.
 
 **Expected result:**
 
-| ChWhat is checkedeck | Expected |
+| What is checked | Expected |
 | ----- | -------- |
 | Base parts reused | Parts unchanged since the upgrade are marked `required` in `inc_backup` (reused from the X-created base, not uploaded again) |
 | New parts uploaded | Data added or rewritten on Y is stored in `inc_backup` as new parts |
-| Mixed-version chain | The chain contains parts created by both X and Y; each backup's `clickhouse_version` reflects the version that made it |
+| Mixed-version chain | The chain contains parts created by both X and Y. Each backup's `clickhouse_version` reflects the version that made it |
 | No version guard | The increment and the restore succeed even though base and increment report different `clickhouse_version` values |
 | Data after restore | The restored table contains exactly the original data plus the changes made on Y |
 
 > [!NOTE]
 > If step 3 shows that the upgrade rewrote existing parts (new names / changed fingerprints), that is a
 > ClickHouse-side behavior: those parts will simply be re-uploaded in `inc_backup`. The restore must still be
-> correct; only the space savings are reduced. Record this if observed, as it affects increment size after an
-> upgrade.
+> correct, only the space savings are reduced. Record this if observed.
 
 ### Scenario 25: Restore an incremental backup into a table that already has data
 
 **Goal:** Confirm and document how restoring an incremental backup behaves when the **target table/database
 already exists and holds data**. This verifies the statements in
-[Restoring Into Empty vs. Non-Empty Tables](#restoring-into-empty-vs-non-empty-tables): a default full restore
+[Restoring Into Empty vs. Non-Empty Tables](#restoring-into-empty-vs-non-empty-tables). A default full restore
 (and `--rm`) **drops and recreates** the table first (so no duplication), whereas a data-only (`--data`)
 restore **attaches on top** of existing data and can duplicate rows. It also confirms that `--partitions`
 replaces only the named partitions, that no case damages part files, and how restore behaves when the target
 has a **different schema** (Case F) or a **different `PARTITION BY`** (Case G) than the backup.
 
 > The deciding factor is whether the **schema step** runs. Schema restore drops the existing object
-> (`DROP TABLE IF EXISTS` via `dropExistsTables`) and recreates it; the data step (`ALTER TABLE ... ATTACH
-> PART`) is purely additive. Default `restore` runs both steps; `--data` runs only the additive data step.
+> (`DROP TABLE IF EXISTS` via `dropExistsTables`) and recreates it. The data step `ALTER TABLE ... ATTACH PART` is purely additive. Default `restore` runs both steps; `--data` runs only the additive data step.
 
 **Steps:**
 
@@ -1318,7 +1315,7 @@ has a **different schema** (Case F) or a **different `PARTITION BY`** (Case G) t
 
 1. Build `base_backup` → `inc_backup` on a plain `MergeTree` table with rows in partitions `p1` and `p2`;
    record the exact rows and the total row count `N`.
-2. On a target that already contains **different/extra** rows in the same table, run a plain `restore inc_backup`
+2. On a target that already contains **different/extra** rows in the same table. Run a plain `restore inc_backup`
    (no `--data`, no `--schema`, no `--rm`).
 3. Compare the row count and rows against the source.
 
@@ -1490,18 +1487,17 @@ target.
 
 | What is checked | Expected |
 | ----- | -------- |
-| Case A — snapshot boundary | The increment contains exactly the parts that were **active at freeze time**: rows inserted before freeze are present, rows inserted after are not. No half-parts; the restored data matches the corresponding source snapshot exactly (per [§3.1](#measuring-data-equivalence)) |
+| Case A — snapshot boundary | The increment contains exactly the parts that were **active at freeze time**: rows inserted before freeze are present, rows inserted after are not. No half-parts. The restored data matches the corresponding source snapshot exactly (per [§3.1](#measuring-data-equivalence)) |
 | Case B — merge correctness | Restore of `inc_backup` reproduces all rows with **no loss and no corruption** |
-| Case B — dedup effect | If the merge finished before the increment's freeze, `inc_backup` **uploads `partC` as new data** (it is not in the base by name/fingerprint), so the increment is larger than a pure delta; if the merge had not finished, `partA`/`partB` are **reused** and the increment is near-empty. Both restore correctly |
-| Case C — mutation captured | The in-progress mutation is recorded and the restored table reflects the mutated data (pending mutations carried forward with `restore_as_attach`); no corruption |
+| Case B — dedup effect | If the merge finished before the increment's freeze, `inc_backup` **uploads `partC` as new data** (it is not in the base by name/fingerprint). So the increment is larger than a pure delta. If the merge had not finished, `partA`/`partB` are **reused** and the increment is near-empty. Both restore correctly |
+| Case C — mutation captured | The in-progress mutation is recorded and the restored table reflects the mutated data (pending mutations carried forward with `restore_as_attach`). No corruption |
 | Case D — column-type guard | With the default `check_parts_columns: true` the backup **aborts** with *"inconsistent data types for active data part"*; with `--skip-check-parts-columns` it proceeds (and the tester must accept the inconsistency risk) |
 | Case E — restore concurrency | `--data` with a concurrent writer yields **duplicated/overlapping rows** (additive, no corruption); a default `restore` drops and recreates the table, so the concurrent writer may hit *"table doesn't exist"* or lose writes during the window — confirming restore should target a quiesced table |
 
 > [!NOTE]
-> All of the above is engine-atomicity behavior, not a `clickhouse-backup` guarantee of transactional isolation
-> across a live workload. The safe operational rule: incremental **backup** creation may run against a live,
+> All of the above is engine-atomicity behavior. The safe operational rule: incremental **backup** creation may run against a live,
 > writing table (a racing column-type `ALTER` aborts the backup rather than corrupting it), but **restore**
-> should run against a quiesced target.
+> should run against a stable target.
 
 ### Scenario 28: Incremental chain across a changed backup storage or folder
 
