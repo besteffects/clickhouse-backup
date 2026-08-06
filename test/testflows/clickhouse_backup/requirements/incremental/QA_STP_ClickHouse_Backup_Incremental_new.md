@@ -645,15 +645,15 @@ match between the source table and the restored table:
 
 **Exact (deterministic) alternative for small tables.** When an ordered, row-by-row comparison is wanted,
 we can select every column ordered by a full key and compare position by position:
-`SELECT * FROM t ORDER BY <all columns that make the row unique>`. This is what the project's integration tests do — `checkData` in `test/integration/utils.go` runs `SELECT * ... ORDER BY <orderBy>` and
+`SELECT * FROM t ORDER BY <all columns that make the row unique>`. This is what the project's integration tests do: `checkData` in `test/integration/utils.go` runs `SELECT * ... ORDER BY <orderBy>` and
 asserts every column of every row plus the total row count. It is precise but memory-heavy, so it is best for
-small fixtures; the aggregate fingerprint above is the scalable default for large tables.
+small tables. The aggregate fingerprint above is the scalable default for large tables.
 
 **Conditions to control before comparing:**
 
 * **Schema/column order must match.** `cityHash64(*)` depends on column order and types. A default `restore`
-  recreates the table from the backup's `CREATE`, so this is guaranteed; if you compare against an
-  independently-defined table, align the column list explicitly.
+  recreates the table from the backup's `CREATE`, so this is guaranteed. If you compare against an
+  independently-defined table, align the column list/order explicitly.
 * **Deduplicating / aggregating engines.** On `ReplacingMergeTree`, `SummingMergeTree`, and
   `AggregatingMergeTree` the visible rows depend on background merges, so take the fingerprint with `FINAL`
   (`SELECT sum(cityHash64(*)) FROM t FINAL`) or after `OPTIMIZE TABLE t FINAL`, on **both** sides.
@@ -694,7 +694,7 @@ Other relevant options and settings:
 
 | Name | Purpose |
 | ---- | ------- |
-| `upload_by_part` (config) | Must be `true` to use `--diff-from-remote`; it is `true` by default |
+| `upload_by_part` (config) | Must be `true` to use `--diff-from-remote`. It is `true` by default |
 | `backups_to_keep_remote` (config) | How many remote backups to keep; must not delete backups still needed by a chain |
 | `--partitions` | Limit a backup or restore to selected partitions |
 | `rebase` (command) | Turn an incremental backup into a self-contained one |
@@ -787,7 +787,7 @@ again.
 | What is checked | Expected |
 | ----- | -------- |
 | Data after restore | Both partitions A and B are present and correct |
-| Backup size | The incremental backup size corresponds roughly to partition B only |
+| Backup size | The incremental backup size shows the partition B size only |
 
 ### Scenario 3: Incremental backup when nothing changed
 
@@ -804,14 +804,14 @@ restores the full data.
 
 | What is checked | Expected |
 | ----- | -------- |
-| Backup size | The incremental backup is nearly empty (only bookkeeping, no data) |
+| Backup size | The incremental backup is nearly empty (only metadata, no table data) |
 | Data after restore | The table matches the original data exactly |
 
 ### Scenario 4: A changed part with the same name is uploaded again
 
 **Goal:** Confirm the most important safety rule — if a part changed but happens to have the same name as one
-in the base backup, its new content is uploaded, not skipped. (clickhouse-backup detects this by comparing the
-part's file checksums, not just its name.)
+in the base backup, its new content is uploaded, not skipped. clickhouse-backup detects this by comparing the
+part's file checksums, not just its name.
 
 **Steps:**
 
@@ -825,13 +825,12 @@ part's file checksums, not just its name.)
 
 | What is checked | Expected |
 | ----- | -------- |
-| Data after restore | The restored data reflects the rewritten content, not the old content |
+| Data after restore | The restored data shows the rewritten content, not the old one |
 | Backup content | The changed data was actually stored in the incremental backup (it was not skipped as "unchanged") |
 
 ### Scenario 5: Incremental backup after deleting data
 
-**Goal:** Confirm that deleting data (dropping a partition) before an incremental backup is reflected on
-restore.
+**Goal:** Confirm that deleting data (dropping a partition) before an incremental backup is created is reflected on backup restore.
 
 **Steps:**
 
@@ -844,7 +843,7 @@ restore.
 
 | What is checked | Expected |
 | ----- | -------- |
-| Data after restore | Only partition A is present; partition B is gone |
+| Data after restore | Only partition A is present. Partition B is gone |
 
 ### Scenario 6: Restore from a long chain of incremental backups
 
@@ -973,7 +972,7 @@ re-uploading data it already handled.
 | What is checked | Expected |
 | ----- | -------- |
 | Resume | The second run completes the backup without errors |
-| No repeated work | Data already uploaded (and reused parts) are not uploaded again |
+| No repeated jobs | Data already uploaded (and reused parts) are not uploaded again |
 | Data after restore | The restored data matches the original |
 
 ### Scenario 13: Incremental backups while ClickHouse merges parts
@@ -1021,14 +1020,14 @@ ClickHouse, reusing unchanged data instead of copying it again.
 > Azure Blob 23.3+). See
 > [Which ClickHouse Versions Are Supported](#which-clickhouse-versions-are-supported).
 
-> Note: This overlaps with existing Go integration coverage of object-disk incremental backups; it is included
+> Note: This overlaps with existing Go integration coverage of object-disk incremental backups. It is included
 > here for the end-to-end / multi-node environment.
 
 **Steps:**
 
-1. Create a table that uses an S3 object-disk storage policy; make a full remote backup.
+1. Create a table that uses an S3 object-disk storage policy -> make a full remote backup.
 2. Add new data, then make an incremental backup with `--diff-from-remote`.
-3. Restore the incremental backup onto an empty table.
+3. Restore the incremental backup into an empty table.
 
 **Expected result:**
 
@@ -1044,7 +1043,7 @@ command (the "embedded" mode, enabled by `use_embedded_backup_restore: true`). I
 computes the difference against the base backup.
 
 > Applies to ClickHouse 22.7+ (`use_embedded_backup_restore: true` and native
-> `BACKUP ... SETTINGS base_backup=...`), so skip it on older versions in the matrix such as `22.3`. See
+> `BACKUP ... SETTINGS base_backup=...`), so skip it on older versions < `22.3`. See
 > [Which ClickHouse Versions Are Supported](#which-clickhouse-versions-are-supported).
 
 **Steps:**
@@ -1060,16 +1059,16 @@ computes the difference against the base backup.
 | Reuse | The incremental backup stores only the changes relative to the base |
 | Data after restore | The restored data matches the original |
 
-> Note: Embedded mode does not support sharded-operation mode, so this scenario is single-node only.
+> Note: Embedded mode does not support sharded clusters mode, so this scenario is single-node only.
 
-### Scenario 17: Incremental backup limited to selected partitions
+### Scenario 17: Incremental backup of selected partitions
 
 **Goal:** Confirm that `--partitions` can limit an incremental backup to specific partitions and still restore
 those partitions correctly.
 
 **Steps:**
 
-1. Create a table with partitions A, B, and C; make a full backup.
+1. Create a table with partitions A, B, and C -> make a full backup.
 2. Add data to B and C, then make an incremental backup with `--diff-from-remote` and `--partitions=B,C`.
 3. Restore the selected partitions onto an empty table.
 
@@ -1082,17 +1081,16 @@ those partitions correctly.
 
 ### Scenario 18: Incremental backups on a two-node sharded cluster
 
-**Goal:** Confirm per-node incremental backups work on the two-node sharded cluster and restore correctly.
-(The environment provides a 2-shard cluster: `clickhouse1` and `clickhouse2`, one shard each.)
+**Goal:** Confirm per-node incremental backups work on the two-node sharded cluster and are restored correctly.
 
 **Steps:**
 
 1. Using the `sharded_cluster` configuration, create a table on both nodes and insert different data on each
    shard.
-2. On each node, make a full backup, then add data and make an incremental backup with `--diff-from-remote`,
+2. On each node, make a full backup. Then add data and make an incremental backup with `--diff-from-remote`,
    using a per-node backup name.
-3. On a clean cluster, restore the schema on both nodes, then restore the data on each node from its own
-   incremental backup.
+3. On a clean cluster, restore the schema on both nodes. 
+4. Restore the data on each node from its own incremental backup.
 
 **Expected result:**
 
@@ -1109,12 +1107,13 @@ so that only the changed portion is transferred.
 **Steps:**
 
 1. Launch the test environment and load a large but practical dataset into a table (for example tens of
-   millions of rows across many partitions — large enough to be meaningful, small enough to finish in CI).
-   Record the table size from `system.parts`.
-2. Make a full remote backup and record how long it takes and how large it is.
-3. Change only a small, known part of the data (add a few new partitions and/or rewrite a couple of existing
-   ones), then make an incremental backup and record its time and size.
-4. Restore the latest incremental backup onto a clean node and compare the data.
+   millions of rows across many partitions). The dataset should be not too big enough, so it would be possible to use it on CI/CD.
+2. Record the table size from `system.parts`.
+3. Make a full remote backup and record how long it takes and how large it is.
+4. Change only a small, known part of the data (add a few new partitions and/or rewrite a couple of existing
+   ones). 
+5. Make an incremental backup and record its time and size.
+6. Restore the latest incremental backup onto a clean node and compare the data.
 
 **Expected result:**
 
@@ -1132,38 +1131,46 @@ backups and cleans up old ones correctly.
 
 **Steps:**
 
-1. Start `watch` with short intervals (a full backup every so often, incremental backups in between) and a
+1. Start `watch` with short intervals (a full backup every large period, incremental backups in between) and a
    remote-retention limit.
-2. Add data between intervals so each cycle produces a new incremental backup based on the previous one.
+2. Add data between intervals, so each cycle produces a new incremental backup based on the previous one.
 3. After several cycles, restore the latest backup onto an empty table.
 
 **Expected result:**
 
 | What is checked | Expected |
 | ----- | -------- |
-| Chain built | Incremental backups are created based on the previous backup; full backups appear on schedule |
+| Chain built | Incremental backups are created based on the previous backup. Full backups appear on schedule |
 | Cleanup | Old backups that are no longer needed are removed, but backups still needed by a chain are kept |
 | Data after restore | The latest backup restores correctly |
 
 ### Scenario 21: How insert size and merges affect incremental backup size
 
-**Goal:** Confirm and document that the size of an incremental backup depends not only on how much data was
-added, but also on how it was inserted and on background merges — inserting the same data in a few large
-inserts (with merges quiet) produces a smaller incremental backup than many tiny inserts or heavy merges.
+**Goal:** Check that an incremental backup’s size depends on how data was written (and whether merges ran), not
+only on how many rows were added. Same new data shall produce different increment sizes in the cases below.
 
 **Steps:**
 
-1. Make a full backup of a baseline table.
-2. Case A: add a fixed amount of new data using a few large inserts, with merges quiet.
-3. Case B: add the same amount of data using many small inserts and/or by triggering merges.
-4. Make an incremental backup for each case and compare their sizes.
+1. Create a baseline table and make a full backup.
+2. **Case A — few large inserts:** stop merges → insert a fixed amount of data in a few large inserts → make an
+   incremental backup → record its size.
+3. Reset to the same baseline (restore the full backup or recreate the table from the full backup).
+4. **Case B — many small inserts:** stop merges → insert the **same** amount of data in many small inserts →
+   make an incremental backup → record its size.
+5. Reset to the same baseline again.
+6. **Case C — merges rewrite parts already in the full backup:** record current part names → run
+   `OPTIMIZE TABLE ... FINAL` until those parts are replaced by new merged names → make an incremental backup →
+   record its size. Goal of this case: show that rewritten parts are uploaded again even though their rows were
+   already in the full backup (`partA + partB → partC`).
+7. Compare sizes A/B/C and restore each increment against the matching source state.
 
 **Expected result:**
 
 | What is checked | Expected |
 | ----- | -------- |
-| Size difference | Case A produces a smaller incremental backup than Case B for the same amount of new data |
-| Data after restore | Both cases restore to the same correct data |
+| Case A vs B | For the same new data, Case B’s increment is larger than Case A’s (more new parts uploaded) |
+| Case C | New merged parts are uploaded. Old full-backup part names are not reused |
+| Restore | Each case restores the correct data for that case |
 
 ### Scenario 22: Incremental backup of Wide/Compact parts and Full/Packed storage
 
@@ -1182,12 +1189,18 @@ identically.
 
 1. Create `MergeTree` tables that force each combination, and confirm from `system.parts` (columns `part_type`
    and `part_storage_type`):
+
+Part type:
    * **Wide**: `SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0`.
    * **Compact**: `SETTINGS min_bytes_for_wide_part = '1G', min_rows_for_wide_part = 100000000`.
+   
+Storage format:
    * **Packed** storage: raise one of `min_bytes_for_full_part_storage` / `min_rows_for_full_part_storage` /
      `min_level_for_full_part_storage` above the part being written (defaults of `0` give `Full` storage), and
      confirm `part_storage_type = 'Packed'`.
-   * At minimum, cover: Wide+Full, Compact+Full, and one Packed case (for example Compact+Packed).
+
+At minimum, cover: Wide+Full, Compact+Full, and one Packed case (for example Compact+Packed).
+
 2. Insert data into each table and make a full backup.
 3. For each table: add data to a new partition, and rewrite one existing partition (for example with
    `OPTIMIZE TABLE ... FINAL`), then make an incremental backup with `--diff-from-remote`.
