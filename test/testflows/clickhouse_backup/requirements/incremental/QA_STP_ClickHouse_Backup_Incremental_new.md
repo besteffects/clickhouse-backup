@@ -1501,10 +1501,8 @@ column-type `ALTER` is rejected rather than corrupting the backup, and that rest
 **Goal:** Verify the storage-location rules
 The rules are:
 
-- a chain is
-resolved **by name in the single configured remote**, 
-- changing the storage type or `path` breaks the chain
-with a clear "not found" error
+- a chain is resolved **by name in the single configured remote**, 
+- changing the storage type or `path` breaks the chain with a clear "not found" error
 - copying the **whole** chain to a new location restores correctly
 - `rebase` produces a self-contained backup that is portable on its own.
 
@@ -1517,8 +1515,7 @@ with a clear "not found" error
 
 1. With `remote_storage` pointed at storage S1 and `path=P1`, create `base_backup` then `inc_backup`
    (`create_remote --diff-from-remote=base_backup`). Confirm `inc_backup`'s `metadata.json` has
-   `required_backup: base_backup`. Restore `inc_backup` onto a clean node and compare against the source
-   (per [§3.1](#measuring-data-equivalence)).
+   `required_backup: base_backup`. Restore `inc_backup` onto a clean node and compare against the source.
 
 *Case B — change the folder/prefix (chain breaks):*
 
@@ -1532,13 +1529,14 @@ with a clear "not found" error
 
 *Case D — migrate the whole chain (works):*
 
-4. Copy the **entire** chain (`base_backup` **and** `inc_backup`, preserving names and directory layout — plus
+4. Copy the **entire** chain (`base_backup` **and** `inc_backup`, preserving names and directory layout. Additionally -
    the referenced `object_disk_path` data if the tables are on object disks) from S1/P1 to the new location
    using a storage-native copy (e.g. `aws s3 sync`). Point config at the new location and restore `inc_backup`.
 
 *Case E — rebase makes a portable, self-contained backup:*
 
-5. In S1/P1 run `rebase` on `inc_backup` (see [Scenario 11](#scenario-11)) so it becomes self-contained
+5. With config still pointing at the original storage and path from Case A (`remote_storage` = S1,
+   `path` = P1), run `rebase` on `inc_backup` (see [Scenario 11](#scenario-11)) so it becomes self-contained
    (`required_backup` empty). Copy **only** that backup to the new location and restore it there.
 
 *Case F — split chain is not possible (negative):*
@@ -1550,16 +1548,18 @@ with a clear "not found" error
 
 | What is checked | Expected |
 | ----- | -------- |
-| Case A — baseline | `inc_backup` records `required_backup: base_backup`; restore reproduces the source exactly |
-| Case B — changed prefix | Restore/download **fails** with `'base_backup' is not found on remote storage` (the base lives under the old prefix `P1`, not `P2`); no data is restored |
-| Case C — changed storage | Same "not found" failure — the base does not exist in S2; the chain cannot be resolved |
+| Case A — baseline | `inc_backup` records `required_backup: base_backup`. Restore reproduces the source exactly |
+| Case B — changed prefix | Restore/download **fails** with `'base_backup' is not found on remote storage` (the base lives under the old prefix `P1`, not `P2`). No data is restored |
+| Case C — changed storage | Same "not found" failure — the base does not exist in S2, and the chain cannot be resolved |
 | Case D — full migration | After copying the **whole** chain (and object-disk data, if any) to the new location, `inc_backup` restores correctly — resolution is by name + layout, not endpoint |
 | Case E — rebase portability | The rebased backup has **no** `required_backup`, so copying just that one backup to the new location restores successfully on its own |
-| Case F — split chain | The create/upload **fails** (or cannot find the base) because both the diff read and later download use the single configured remote; a chain cannot span two storages |
+| Case F — split chain | The create/upload **fails** (or cannot find the base) because both the diff read and later download use the single configured remote. A chain cannot use two storages |
 
 > [!NOTE]
-> The safe operational patterns for moving storage are: (a) copy the **entire** chain atomically (all backup
-> names, full directory layout, plus `object_disk_path` data for object disks), (b) `rebase` a backup to make it
-> self-contained and move just that one, or (c) start a **new full backup** in the new location and begin a
-> fresh chain. Never move only some backups of a chain.
+> The safe operational patterns for moving storage are: 
+-  copy the **entire** chain atomically (all backup names, full directory layout, plus `object_disk_path` data for object disks),
+- `rebase` a backup to make it self-contained and move just that one
+  
+  Or
+ - start a **new full backup** in the new location and begin a fresh chain. Never move only some backups of a chain.
 
