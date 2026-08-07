@@ -1298,9 +1298,8 @@ new, and the final restore is correct. This verifies the compatibility statement
 
 ### Scenario 25: Restore an incremental backup into a table that already has data
 
-**Goal:** Confirm and document how restoring an incremental backup behaves when the **target table/database
-already exists and holds data**. This verifies the statements in
-[Restoring Into Empty vs. Non-Empty Tables](#restoring-into-empty-vs-non-empty-tables). A default full restore
+**Goal:** Check how restoring an incremental backup behaves when the **target table/database
+already exists and holds data**. A default full restore
 (and `--rm`) **drops and recreates** the table first (so no duplication), whereas a data-only (`--data`)
 restore **attaches on top** of existing data and can duplicate rows. It also confirms that `--partitions`
 replaces only the named partitions, that no case damages part files, and how restore behaves when the target
@@ -1311,10 +1310,10 @@ has a **different schema** (Case F) or a **different `PARTITION BY`** (Case G) t
 
 **Steps:**
 
-*Case A — default full restore (schema + data) onto a populated table (drops first):*
+*Case A — default full restore (schema + data) onto a populated table:*
 
 1. Build `base_backup` → `inc_backup` on a plain `MergeTree` table with rows in partitions `p1` and `p2`;
-   record the exact rows and the total row count `N`.
+   record the exact rows and the total row count `N` for each partition.
 2. On a target that already contains **different/extra** rows in the same table. Run a plain `restore inc_backup`
    (no `--data`, no `--schema`, no `--rm`).
 3. Compare the row count and rows against the source.
@@ -1364,36 +1363,34 @@ has a **different schema** (Case F) or a **different `PARTITION BY`** (Case G) t
 
 | What is checked | Expected |
 | ----- | -------- |
-| Case A — drop then recreate | The default restore drops the existing table (`DROP TABLE IF EXISTS`) and recreates it before attaching, so the pre-existing extra rows are gone and the table matches the source exactly (count `N`); no duplication |
-| Case B — no error | The data-only restore succeeds; the target is not required to be empty |
+| Case A — drop then recreate | The default restore drops the existing table (`DROP TABLE IF EXISTS`) and recreates it before attaching, so the pre-existing extra rows are gone and the table matches the source exactly (count `N`). No duplication |
+| Case B — no error | The data-only restore succeeds. The target is not required to be empty |
 | Case B — duplication | The target now holds roughly `2N` rows: parts are attached on top of the existing data (overlapping rows are duplicated, not merged or overwritten) |
 | Case B — no corruption | Every attached part is valid and queryable; the issue is duplicated rows only, never damaged files |
-| Case C — targeted replace | `p1` is dropped and re-attached from the backup, so `p1` matches the source with no duplication; `p2` is left exactly as it was on the target (untouched) |
+| Case C — targeted replace | `p1` is dropped and re-attached from the backup, so `p1` matches the source with no duplication. `p2` is left exactly as it was on the target (untouched) |
 | Case D — clean copy | After `--rm` the table exactly matches the source (same rows, same count `N`), with no leftover pre-existing data |
-| Case E — engine behavior | Immediately after restore the `ReplacingMergeTree` may report doubled counts; after `OPTIMIZE ... FINAL` duplicates collapse. Confirms that row-count checks on deduplicating engines must account for merge timing |
-| Case F — plain restore replaces schema | The default restore drops the differently-structured target by name and recreates it from the backup's `CREATE` statement; the final table has the **backup's schema and data**, and the target's old structure and rows are gone (no merge of the two schemas) |
-| Case F — data-only restore keeps schema | The data-only restore leaves the target's different structure in place; ClickHouse validates each part during `ATTACH PART` — an **incompatible** structure makes the restore **fail with an error**, while a **compatible** one attaches the parts (with the Case B duplication caveat). `clickhouse-backup` never reconciles the schema difference in this mode |
+| Case E — engine behavior | Immediately after restore the `ReplacingMergeTree` may report doubled counts. After `OPTIMIZE ... FINAL` duplicates collapse. Confirms that row-count checks on deduplicating engines must account for merge timing |
+| Case F — plain restore replaces schema | The default restore drops the differently-structured target by name and recreates it from the backup's `CREATE` statement. The final table has the **backup's schema and data**, and the target's old structure and rows are gone (no merge of the two schemas) |
+| Case F — data-only restore keeps schema | The data-only restore leaves the target's different structure in place. ClickHouse validates each part during `ATTACH PART` — an **incompatible** structure makes the restore **fail with an error**, while a **compatible** one attaches the parts (with the Case B duplication caveat). `clickhouse-backup` never reconciles the schema difference in this mode |
 | Case G — `PARTITION BY` mismatch fails on `--data` | The data-only restore **fails**: `ATTACH PART` is rejected because the target's `PARTITION BY` produces a different `partition_id` than the part carries (the part directory name encodes the backup's `partition_id`). No data is attached; no silent re-partitioning happens |
 | Case G — `--rm` succeeds | The `--rm` (drop + recreate) run recreates the table from the backup's `CREATE`, so its `PARTITION BY` matches the backup and all parts attach cleanly (count `N`). Confirms the mismatch is only reachable on the data-only path |
 
 > [!NOTE]
 > Case B is a *documented behavior* check, not a bug: a data-only restore onto a populated table is additive by
 > design because it skips the schema (drop) step. For a faithful restore use a plain `restore` or `--rm` (both
-> drop and recreate); to replace specific partitions use `--data --partitions=...`. In embedded mode the same
+> drop and recreate). To replace specific partitions use `--data --partitions=...`. In embedded mode the same
 > behavior applies and non-empty data restore is enabled explicitly via `allow_non_empty_tables=1`.
 > If `restore_schema_on_cluster` is configured, a schema-dropping restore may abort and require `--rm`/`--drop`
 > when the target already has rows (ChangeLog [#1325]).
 
 ### Scenario 26: Restore an incremental backup on a multi-replica cluster
 
-**Goal:** Confirm the multi-replica restore workflow for an **incremental** backup: schema is restored on every
+**Goal:** Confirm the multi-replica restore workflow for an **incremental** backup. Schema is restored on every
 replica, data is restored on only the first replica of each shard, and ClickHouse replication then propagates
-the increment's own parts **and** the `required` base-chain parts to the sibling replicas — so the siblings end
-up identical without ever reading the backup chain. This verifies
-[Incremental Restore in a Multi-Replica Setup](#incremental-restore-in-a-multi-replica-setup).
+the increment's own parts **and** the `required` base-chain parts to the sibling replicas. So the siblings end
+up identical without ever reading the backup chain.
 
-> Use a shard with at least two replicas (`ReplicatedMergeTree` with a `{replica}` macro). This scenario is
-> about the *restore* fan-out, so keep it single-shard/two-replica to stay focused; the sharded case is covered
+> Use a shard with at least two replicas (`ReplicatedMergeTree` with a `{replica}` macro). In this scenario keep a single-shard/two-replica to stay focused. The sharded case is covered
 > by [Scenario 18](#scenario-18). Keep `check_replicas_before_attach: true` (default).
 
 **Steps:**
@@ -1420,10 +1417,10 @@ up identical without ever reading the backup chain. This verifies
 
 | What is checked | Expected |
 | ----- | -------- |
-| Schema on all replicas | After step 3 the table exists on both replica A and B with matching structure; each replica is registered in Keeper |
+| Schema on all replicas | After step 3 the table exists on both replica A and B with matching structure. Each replica is registered in ZooKeeper |
 | Data on first replica | After step 4 replica A holds the full dataset (base + increment), count `N` |
-| Replication to siblings | After step 5 replica B holds the **same** count `N` and the same rows as A, produced by native replication — the base-chain and increment parts both arrive without B reading any backup |
-| Chain locality | Replica B never needed the backup chain locally; only replica A resolved and read `base_backup` + `inc_backup` |
+| Replication to siblings | After step 5 replica B holds the **same** count `N` and the same rows as A, produced by native replication. The base-chain and increment parts both arrive without B reading any backup |
+| Chain locality | Replica B never needed the backup chain locally. Only replica A resolved and read `base_backup` + `inc_backup` |
 | Negative — double `--data` | Running `--data` on both replicas attaches the same parts twice → duplicated rows (≈ `2N`); confirms why data restore must run on only one replica per shard (and that `check_replicas_before_attach` is the guard) |
 | Contrast — plain `MergeTree` | With a non-replicated engine, node A holds count `N` but node B stays **empty** — nothing propagates. To populate node B you must also run `--data` on B (each node needs the chain locally). Confirms the "first replica only" rule is specific to `Replicated*MergeTree` |
 
@@ -1432,21 +1429,21 @@ up identical without ever reading the backup chain. This verifies
 > (the Kubernetes restore `Job` uses `CLICKHOUSE_SCHEMA_RESTORE_SERVICES` = all replicas and
 > `CLICKHOUSE_DATA_RESTORE_SERVICES` = first replica per shard). The only incremental-specific aspect is that
 > the single `--data` node attaches both the increment's own parts and the `required` parts pulled from the base
-> backups; replication then makes the siblings identical.
+> backups. Replication then makes the siblings identical.
 
 ### Scenario 27: Parallel INSERT / ALTER during incremental backup and restore
 
-**Goal:** Verify the concurrency behavior documented in
-[Concurrent INSERT / ALTER During Backup and Restore](#concurrent-insert--alter-during-backup-and-restore):
-that an incremental backup taken against a table that is being written/merged/altered stays **consistent and
-correct**, that concurrent merges only change how much the increment re-uploads (not correctness), that a racing
-column-type `ALTER` is rejected rather than corrupting the backup, and that restore is meant for a quiesced
-target.
+**Goal:** Verify the concurrency behavior.
+
+Verify that an incremental backup taken against a table that is being written/merged/altered stays **consistent and
+correct**. 
+
+Check that concurrent merges only change how much the increment re-uploads (not correctness), that a racing
+column-type `ALTER` is rejected rather than corrupting the backup, and that restore is meant for an inactive target.
 
 > This is the `partA + partB → partC` question made concrete. `clickhouse-backup` never stops merges or locks
-> the table; a backup's data is the `ALTER TABLE ... FREEZE` snapshot of the **active** parts at freeze time.
-> The merge sub-case overlaps [Scenario 13](#scenario-13); this scenario adds the explicit INSERT and ALTER
-> races on top.
+> the table. A backup's data is the `ALTER TABLE ... FREEZE` snapshot of the **active** parts at freeze time.
+> The merge sub-case overlaps [Scenario 13](#scenario-13). This scenario adds the explicit INSERT and ALTER commands on top.
 
 **Steps:**
 
@@ -1457,13 +1454,13 @@ target.
    (`create --diff-from-remote=base_backup`). Record the increment's stored rows.
 3. Restore `inc_backup` onto a clean node and compare against the source snapshot.
 
-*Case B — parallel merge produces `partC` (the diagram):*
+*Case B — parallel merge produces `partC`:*
 
 4. On a fresh table with `SYSTEM STOP MERGES`, insert twice into one partition to get two parts `partA`, `partB`;
    take `base_backup` (records `partA`, `partB`).
 5. Run `SYSTEM START MERGES` / `OPTIMIZE TABLE ... FINAL` so `partA + partB` merge into a single `partC`, then
    take `inc_backup`.
-6. Inspect what `inc_backup` uploaded (new vs. reused parts) and restore it onto a clean node; compare data.
+6. Inspect what `inc_backup` uploaded (new vs. reused parts) and restore it onto a clean node. Then compare data.
 
 *Case C — parallel data-rewriting ALTER / mutation during create:*
 
@@ -1479,7 +1476,7 @@ target.
 
 *Case E — parallel INSERT during restore:*
 
-10. Restore `inc_backup` with `--data` onto a table while a background `INSERT` writes overlapping rows; compare
+10. Restore `inc_backup` with `--data` onto a table while a background `INSERT` writes overlapping rows. Compare
     the count. Then repeat with a default `restore` (drop + recreate) and observe behavior of the concurrent
     writer.
 
@@ -1487,25 +1484,29 @@ target.
 
 | What is checked | Expected |
 | ----- | -------- |
-| Case A — snapshot boundary | The increment contains exactly the parts that were **active at freeze time**: rows inserted before freeze are present, rows inserted after are not. No half-parts. The restored data matches the corresponding source snapshot exactly (per [§3.1](#measuring-data-equivalence)) |
+| Case A — snapshot boundary | The increment contains exactly the parts that were **active at freeze time**: rows inserted before freeze are present, rows inserted after are not. No half-parts. The restored data matches the corresponding source snapshot exactly. |
 | Case B — merge correctness | Restore of `inc_backup` reproduces all rows with **no loss and no corruption** |
 | Case B — dedup effect | If the merge finished before the increment's freeze, `inc_backup` **uploads `partC` as new data** (it is not in the base by name/fingerprint). So the increment is larger than a pure delta. If the merge had not finished, `partA`/`partB` are **reused** and the increment is near-empty. Both restore correctly |
 | Case C — mutation captured | The in-progress mutation is recorded and the restored table reflects the mutated data (pending mutations carried forward with `restore_as_attach`). No corruption |
-| Case D — column-type guard | With the default `check_parts_columns: true` the backup **aborts** with *"inconsistent data types for active data part"*; with `--skip-check-parts-columns` it proceeds (and the tester must accept the inconsistency risk) |
-| Case E — restore concurrency | `--data` with a concurrent writer yields **duplicated/overlapping rows** (additive, no corruption); a default `restore` drops and recreates the table, so the concurrent writer may hit *"table doesn't exist"* or lose writes during the window — confirming restore should target a quiesced table |
+| Case D — column-type guard | With the default `check_parts_columns: true` the backup **aborts** with *"inconsistent data types for active data part"*. With `--skip-check-parts-columns` it proceeds (inconsistency risk is acceptable) |
+| Case E — restore concurrency | `--data` with a concurrent writer yields **duplicated/overlapping rows** (additive, no corruption). A default `restore` drops and recreates the table, so the concurrent writer may hit *"table doesn't exist"* or lose writes during the window — confirming restore should target a inactive table |
 
 > [!NOTE]
 > All of the above is engine-atomicity behavior. The safe operational rule: incremental **backup** creation may run against a live,
 > writing table (a racing column-type `ALTER` aborts the backup rather than corrupting it), but **restore**
-> should run against a stable target.
+> should run against a **stable** target.
 
 ### Scenario 28: Incremental chain across a changed backup storage or folder
 
-**Goal:** Verify the storage-location rules in
-[Backup Storage Location and Chain Portability](#backup-storage-location-and-chain-portability): that a chain is
-resolved **by name in the single configured remote**, that changing the storage type or `path` breaks the chain
-with a clear "not found" error, that copying the **whole** chain to a new location restores correctly, and that
-`rebase` produces a self-contained backup that is portable on its own.
+**Goal:** Verify the storage-location rules
+The rules are:
+
+- a chain is
+resolved **by name in the single configured remote**, 
+- changing the storage type or `path` breaks the chain
+with a clear "not found" error
+- copying the **whole** chain to a new location restores correctly
+- `rebase` produces a self-contained backup that is portable on its own.
 
 > The increment stores only `required_backup: <name>` — no endpoint, type, or path. Everything below follows
 > from name-based resolution against whatever remote the current config points to.
