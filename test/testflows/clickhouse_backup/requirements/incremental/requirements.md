@@ -33,19 +33,21 @@
         * 4.3.1 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore](#rqsrs-013clickhousebackuputilityincrementalrestore)
         * 4.3.2 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.Chain](#rqsrs-013clickhousebackuputilityincrementalrestorechain)
         * 4.3.3 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.EarlierBackup](#rqsrs-013clickhousebackuputilityincrementalrestoreearlierbackup)
-        * 4.3.4 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.BaseFromLocalOrRemote](#rqsrs-013clickhousebackuputilityincrementalrestorebasefromlocalorremote)
-        * 4.3.5 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.MissingBase](#rqsrs-013clickhousebackuputilityincrementalrestoremissingbase)
-        * 4.3.6 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.NonEmptyTarget](#rqsrs-013clickhousebackuputilityincrementalrestorenonemptytarget)
-        * 4.3.7 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.DataOnly](#rqsrs-013clickhousebackuputilityincrementalrestoredataonly)
-        * 4.3.8 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.Partitions](#rqsrs-013clickhousebackuputilityincrementalrestorepartitions)
-        * 4.3.9 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.DifferentSchema](#rqsrs-013clickhousebackuputilityincrementalrestoredifferentschema)
-        * 4.3.10 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.DifferentPartitionBy](#rqsrs-013clickhousebackuputilityincrementalrestoredifferentpartitionby)
+        * 4.3.4 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.BaseFromRemote](#rqsrs-013clickhousebackuputilityincrementalrestorebasefromremote)
+        * 4.3.5 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.BaseFromLocal](#rqsrs-013clickhousebackuputilityincrementalrestorebasefromlocal)
+        * 4.3.6 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.MissingBase](#rqsrs-013clickhousebackuputilityincrementalrestoremissingbase)
+        * 4.3.7 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.NonEmptyTarget](#rqsrs-013clickhousebackuputilityincrementalrestorenonemptytarget)
+        * 4.3.8 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.DataOnly](#rqsrs-013clickhousebackuputilityincrementalrestoredataonly)
+        * 4.3.9 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.Partitions](#rqsrs-013clickhousebackuputilityincrementalrestorepartitions)
+        * 4.3.10 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.DifferentSchema](#rqsrs-013clickhousebackuputilityincrementalrestoredifferentschema)
+        * 4.3.11 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.DifferentPartitionBy](#rqsrs-013clickhousebackuputilityincrementalrestoredifferentpartitionby)
     * 4.4 [Retention](#retention)
         * 4.4.1 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Retention.RequiredBackups](#rqsrs-013clickhousebackuputilityincrementalretentionrequiredbackups)
     * 4.5 [Rebase Command](#rebase-command)
         * 4.5.1 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Rebase.SelfContained](#rqsrs-013clickhousebackuputilityincrementalrebaseselfcontained)
     * 4.6 [Watch Command](#watch-command)
         * 4.6.1 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Watch.Chains](#rqsrs-013clickhousebackuputilityincrementalwatchchains)
+        * 4.6.2 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Watch.Restore](#rqsrs-013clickhousebackuputilityincrementalwatchrestore)
     * 4.7 [Upload](#upload)
         * 4.7.1 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Upload.Resume](#rqsrs-013clickhousebackuputilityincrementaluploadresume)
     * 4.8 [Partitions](#partitions)
@@ -55,7 +57,8 @@
     * 4.10 [Embedded Backups](#embedded-backups)
         * 4.10.1 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Embedded.BaseBackup](#rqsrs-013clickhousebackuputilityincrementalembeddedbasebackup)
     * 4.11 [Patch Parts](#patch-parts)
-        * 4.11.1 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.PatchParts.Materialize](#rqsrs-013clickhousebackuputilityincrementalpatchpartsmaterialize)
+        * 4.11.1 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.PatchParts.PartitionsMiss](#rqsrs-013clickhousebackuputilityincrementalpatchpartspartitionsmiss)
+        * 4.11.2 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.PatchParts.ApplyPatches](#rqsrs-013clickhousebackuputilityincrementalpatchpartsapplypatches)
     * 4.12 [ClickHouse Version Compatibility](#clickhouse-version-compatibility)
         * 4.12.1 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Versions.Supported](#rqsrs-013clickhousebackuputilityincrementalversionssupported)
         * 4.12.2 [RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Versions.MixedChain](#rqsrs-013clickhousebackuputilityincrementalversionsmixedchain)
@@ -173,16 +176,16 @@ version: 1.0
 Each incremental backup SHALL record exactly one base backup in its `metadata.json` as
 `required_backup: <name>`, forming a linear chain that ends at a full backup.
 
-The chain depth SHALL NOT be limited by the utility.
+The chain depth is not limited by the utility.
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.SupportedTableEngines
 version: 1.0
 
-Incremental part reuse SHALL apply to MergeTree-family tables (plain, `Replicated*`, and object-disk backed),
-because only they store data as parts.
+Incremental part reuse SHALL apply to MergeTree-family tables and their `Replicated*` variants,
+because only these engines store data as parts.
 
 Tables of engines that have no parts (`Memory`, `Log`, `TinyLog`, `Set`) SHALL still be backed up, but SHALL NOT
-participate in part reuse.
+participate in parts reuse.
 
 ### Part Reuse and Deduplication
 
@@ -237,7 +240,7 @@ At minimum `Wide`+`Full`, `Compact`+`Full`, and one `Packed` combination SHALL b
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore
 version: 1.0
 
-Restoring an incremental backup SHALL produce a table whose data [matches the source](#restored-data-matches-the-source)
+Restoring an incremental backup SHALL produce a table whose data matches the source
 at the moment that backup was created.
 
 An incremental backup SHALL store the complete table schema of its own, so the schema step SHALL NOT need the
@@ -255,11 +258,15 @@ version: 1.0
 Restoring a backup from the middle of a chain SHALL produce the data as it was when that backup was created,
 and SHALL NOT include data added by later increments.
 
-#### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.BaseFromLocalOrRemote
+#### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.BaseFromRemote
 version: 1.0
 
-Restore SHALL succeed both when the base backup is already present locally and when it has to be downloaded from
-remote storage, and SHALL produce identical data in both cases.
+Restore of an incremental backup SHALL download reused parts from remote storage by default.
+
+#### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.BaseFromLocal
+version: 1.0
+
+If the base backup is already on the local disk, restore SHALL take reused parts from there.
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.MissingBase
 version: 1.0
@@ -272,7 +279,7 @@ incremental backup SHALL fail with an error naming the missing backup
 version: 1.0
 
 A plain `restore` of an incremental backup (and `restore --rm`) SHALL drop and recreate the target table before
-attaching parts, so a populated target SHALL end up matching the source with no duplicated rows.
+attaching parts. A populated target SHALL end up matching the source with no duplicated rows.
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.DataOnly
 version: 1.0
@@ -280,7 +287,7 @@ version: 1.0
 A data-only restore (`restore --data`) SHALL NOT drop the target table and SHALL attach the backup's parts on
 top of the existing data.
 
-Overlapping rows SHALL become duplicated rows. The attached parts SHALL stay valid and queryable.
+Overlapping rows SHALL become duplicated rows (this is intentional behaviour). The attached parts SHALL stay valid and queryable.
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.Partitions
 version: 1.0
@@ -298,26 +305,25 @@ When the target table has a different schema than the backup:
 * `restore --data` SHALL keep the target's schema and rely on ClickHouse validation of `ATTACH PART`, failing
   with an error when the structures are incompatible.
 
-The utility SHALL NOT merge or reconcile the two schemas.
+The utility SHALL NOT merge or reconcile the two differing schemas.
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Restore.DifferentPartitionBy
 version: 1.0
 
 `restore --data` into a table whose `PARTITION BY` differs from the backup SHALL fail on `ATTACH PART`, because
-the target computes a different `partition_id` than the part carries. No data SHALL be attached and no silent
+the target computes a different `partition_id` than the part has. No data SHALL be attached and no silent
 re-partitioning SHALL happen.
 
 The same restore run with `--rm` SHALL succeed, since the table is recreated from the backup's own `CREATE`.
 
-### Retention
+### Backup Retention
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Retention.RequiredBackups
 version: 1.0
 
-Remote retention (`backups_to_keep_remote`) SHALL NOT delete a backup that a kept backup still requires through
-`required_backup`, even when the number of remote backups exceeds the configured limit.
-
-The newest backup SHALL remain restorable after the cleanup runs.
+Remote retention (`backups_to_keep_remote`) SHALL keep the newest N backups.
+It SHALL NOT delete an older backup if a kept backup still depends on it via `required_backup`.
+The newest backup SHALL remain restorable after the cleanup.
 
 ### Rebase Command
 
@@ -335,19 +341,23 @@ correctly on its own.
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Watch.Chains
 version: 1.0
 
-The `watch` command SHALL create full backups on the configured schedule and incremental backups based on the
-previous backup in between.
+The `watch` command SHALL create a full backup every `--full-interval`.
+It SHALL create an incremental backup every `--watch-interval`.
+Each increment SHALL use the previous backup as its base with `--diff-from-remote`.
 
-Old backups SHALL be cleaned up according to retention, while backups that a kept chain still requires SHALL be
-preserved, and the newest backup SHALL restore correctly.
+#### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Watch.Restore
+version: 1.0
+
+The latest backup created by `watch` SHALL restore correctly.
 
 ### Upload
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Upload.Resume
 version: 1.0
 
-An incremental upload that was interrupted SHALL be able to finish when the same upload is run again, SHALL NOT
-upload data it already uploaded, and the finished backup SHALL restore correctly.
+An interrupted incremental upload SHALL finish when the same upload is run again.
+It SHALL NOT upload data that was already uploaded.
+The finished backup SHALL restore correctly.
 
 ### Partitions
 
@@ -373,25 +383,35 @@ This applies to ClickHouse versions that support the object-disk type under test
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Embedded.BaseBackup
 version: 1.0
 
-With `use_embedded_backup_restore: true`, an incremental backup created with `--diff-from-remote` SHALL pass the
-base backup to the native `BACKUP ... SETTINGS base_backup=...` statement, SHALL store only the changes relative
-to the base, and SHALL restore data that matches the source.
+With `use_embedded_backup_restore: true`, `create --diff-from-remote` SHALL pass the base to ClickHouse as
+`BACKUP ... SETTINGS base_backup=...`.
+The incremental backup SHALL store only the changes relative to the base.
+The restored data SHALL match the source.
 
-Embedded incremental backups SHALL be tested on ClickHouse `22.8`+ and skipped on `22.3`. `--diff-from` (local
-base) SHALL be regular-mode only.
+This applies to ClickHouse 22.8+. `--diff-from` is not used in embedded mode.
 
 ### Patch Parts
 
-#### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.PatchParts.Materialize
+#### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.PatchParts.PartitionsMiss
 version: 1.0
 
-A patch part written by a lightweight `UPDATE` (ClickHouse 25.7+) lives in a separate partition named
-`patch-<hash>-<original_partition_id>` and has no special handling in [clickhouse-backup].
+A lightweight `UPDATE` writes a patch part in a separate partition named `patch-<hash>-<original_partition_id>`.
+[clickhouse-backup] has no special handling for patch parts.
+An incremental backup with `--partitions` set to the original partition SHALL NOT include that patch part.
+The restored data SHALL NOT contain the pending update.
 
-* A partition-scoped incremental backup (`--partitions=<original_partition>`) SHALL NOT include the patch part,
-  so the restored data SHALL NOT reflect the pending update.
-* After `ALTER TABLE ... APPLY PATCHES`, the update SHALL be stored in ordinary parts, SHALL be included in the
-  incremental backup, and SHALL be present after restore.
+This applies to ClickHouse 25.8+.
+
+#### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.PatchParts.ApplyPatches
+version: 1.0
+
+[clickhouse-backup] has no special handling for patch parts from a lightweight `UPDATE`.
+After `ALTER TABLE ... APPLY PATCHES` (or after background merges finish), the update is written into Wide or Compact parts.
+No `patch-<hash>-<original_partition_id>` partition SHALL remain.
+An incremental backup SHALL include that update.
+The restored data SHALL contain the updated data.
+
+This applies to ClickHouse 25.8+.
 
 ### ClickHouse Version Compatibility
 
@@ -407,6 +427,7 @@ version: 1.0
 A chain whose base backup was created on ClickHouse version X and whose increments are created on a newer
 version Y SHALL work, because part reuse is decided only by part name and fingerprint and never by the
 ClickHouse version.
+The following SHALL be true:
 
 * Parts not rewritten by the upgrade SHALL be reused from the base.
 * Parts rewritten on Y SHALL be uploaded as new data.
@@ -426,7 +447,7 @@ restoring every node from its own increment SHALL reproduce the combined cluster
 version: 1.0
 
 For `Replicated*MergeTree` tables, the schema step (`restore_remote --schema --rm`) SHALL be run on every
-replica, so each replica has its own table definition and its own replica entry in Keeper.
+replica, so each replica has its own table definition and its own replica entry in Zookeeper/Keeper.
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Cluster.Replicated.Data
 version: 1.0
@@ -452,7 +473,7 @@ one node SHALL leave the other nodes empty, so the data step SHALL be run on eve
 version: 1.0
 
 An incremental backup created while a table is being written SHALL contain exactly the parts that were active at
-`ALTER TABLE ... FREEZE` time. Rows inserted before the freeze SHALL be in the backup, rows inserted after it
+`ALTER TABLE ... FREEZE` time. Rows inserted before the freeze SHALL be in the backup. Rows inserted after it
 SHALL NOT, and no partially written part SHALL be included.
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Concurrent.Merge
@@ -528,18 +549,17 @@ backup of the same table, in proportion to the amount of data that changed.
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Size.InsertPattern
 version: 1.0
 
-For the same amount of new data, the size of an incremental backup SHALL depend on how many new parts were
-produced: many small inserts SHALL result in a larger increment than a few large inserts, and parts rewritten by
-merges SHALL be uploaded again.
-
-Every case SHALL restore the data of its own source state correctly.
+For the same amount of new data, many small inserts SHALL produce a larger incremental backup than a few large inserts.
+Parts rewritten by a merge SHALL be uploaded again.
+Each case SHALL restore its own source data correctly.
 
 #### RQ.SRS-013.ClickHouse.BackupUtility.Incremental.Size.LargeDataset
 version: 1.0
 
-On a large dataset with a small change, the incremental backup SHALL be far smaller and faster than the full
-backup, SHALL reuse most of the data, SHALL restore data that matches the source, and SHALL complete without
-running out of memory or disk space.
+On a large dataset with a small change, the incremental backup SHALL be far smaller and faster than the full backup.
+Most of the data SHALL be reused from the full backup.
+The restored data SHALL match the source.
+The run SHALL complete without running out of memory or disk space.
 
 ## References
 
